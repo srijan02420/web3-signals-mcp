@@ -42,8 +42,20 @@ class SignalFusion:
                 errors.append(f"{role}: no data in storage")
 
         # Score each asset across all dimensions
-        # Try loading learned weights from optimizer; fall back to YAML
-        weights = self.profile.get("weights", {})
+        # Weight selection: asymmetric (direction-aware) > learned > flat YAML
+        asym_cfg = self.profile.get("weights_asymmetric", {})
+        asym_enabled = asym_cfg.get("enabled", False)
+        weights_default = asym_cfg.get("default", self.profile.get("weights", {}))
+        weights_bullish = asym_cfg.get("bullish", weights_default)
+        weights_bearish = asym_cfg.get("bearish", weights_default)
+
+        if not asym_enabled:
+            # Fall back to flat weights (legacy behaviour)
+            weights_default = self.profile.get("weights", {})
+            weights_bullish = weights_default
+            weights_bearish = weights_default
+
+        # Self-learning optimizer can override the default set
         learning_cfg = self.profile.get("learning", {})
         if learning_cfg.get("enabled", False):
             try:
@@ -51,7 +63,11 @@ class SignalFusion:
                 optimizer = WeightOptimizer(self.store, self.profile)
                 learned = optimizer.get_current_weights()
                 if learned:
-                    weights = learned
+                    # Learned weights override default only (not directional sets)
+                    weights_default = learned
+                    if not asym_enabled:
+                        weights_bullish = learned
+                        weights_bearish = learned
                     errors.append(f"using learned weights: {learned}")
             except Exception as exc:
                 errors.append(f"optimizer load failed: {exc}")
@@ -107,9 +123,39 @@ class SignalFusion:
             whale_data_tier = data_tiers.get("whale", "full")
 
             # --- Phase 3: Calculate adjusted weights ---
+            # Direction-aware weight selection: compute unweighted average of
+            # raw dimension scores to determine if the signal leans bullish or
+            # bearish, then pick the appropriate weight set.
+            raw_avg = sum(raw_scores[r][0] for r in all_roles) / len(all_roles)
+            if asym_enabled:
+                if raw_avg > 50:
+                    weights = weights_bullish
+                elif raw_avg < 50:
+                    weights = weights_bearish
+                else:
+                    weights = weights_default
+            else:
+                weights = weights_default
+
             base_weights: Dict[str, float] = {}
             for role in all_roles:
                 base_weights[role] = float(weights.get(role, 0.0))
+
+            # Direction gating: zero out dimensions toxic in specific directions
+            gating_cfg = self.profile.get("direction_gating", {})
+            if gating_cfg.get("enabled", False):
+                gates = gating_cfg.get("gates", {})
+                direction_lean = "bullish" if raw_avg > 50 else "bearish" if raw_avg < 50 else "neutral"
+                for role in all_roles:
+                    role_gates = gates.get(role, {})
+                    gate_key = f"{direction_lean}_gate"
+                    if role_gates.get(gate_key, False):
+                        base_weights[role] = 0.0
+                # Renormalize to sum to 1.0
+                total_w = sum(base_weights.values())
+                if total_w > 0:
+                    for role in all_roles:
+                        base_weights[role] = base_weights[role] / total_w
 
             # Apply tier multipliers to ALL agents, then redistribute freed weight
             adjusted_weights: Dict[str, float] = {}
@@ -370,10 +416,42 @@ class SignalFusion:
         return score, "; ".join(details) if details else "no whale activity"
 
     # ================================================================ #
+    #  Asset tier helpers (for per-tier scoring overrides)
+    # ================================================================ #
+
+    def _get_asset_tier(self, asset: str) -> str:
+        """Determine which tier an asset belongs to. Default: 'contrarian'."""
+        tier_cfg = self.profile.get("asset_tiers", {})
+        if not tier_cfg.get("enabled", False):
+            return "contrarian"
+        for tier_name, tier_def in tier_cfg.get("tiers", {}).items():
+            if asset in [a.upper() for a in tier_def.get("assets", [])]:
+                return tier_name
+        return "contrarian"
+
+    def _merge_rules(self, base: Dict[str, Any], overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Shallow merge: for each key in overrides, if both are dicts, merge sub-keys."""
+        merged = dict(base)
+        for key, val in overrides.items():
+            if isinstance(val, dict) and isinstance(merged.get(key), dict):
+                merged[key] = {**merged[key], **val}
+            else:
+                merged[key] = val
+        return merged
+
+    # ================================================================ #
     #  TECHNICAL scorer
     # ================================================================ #
 
     def _score_technical(self, asset: str, data: Dict[str, Any], rules: Dict[str, Any]) -> Tuple[float, str]:
+        # Apply asset tier overrides (momentum vs contrarian)
+        tier_cfg = self.profile.get("asset_tiers", {})
+        if tier_cfg.get("enabled", False):
+            tier = self._get_asset_tier(asset)
+            overrides = tier_cfg.get("technical_overrides", {}).get(tier, {})
+            if overrides:
+                rules = self._merge_rules(rules, overrides)
+
         by_asset = data.get("by_asset", {})
         asset_data = by_asset.get(asset, {})
         if not asset_data:
@@ -725,6 +803,39 @@ class SignalFusion:
             else:
                 score += float(fg_rules.get("extreme_greed_score", 5))
                 details.append(f"F&G {fg:.0f} extreme greed")
+
+        # BTC Dominance (global, scored differently for BTC vs alts)
+        btcd_rules = rules.get("btc_dominance", {})
+        if btcd_rules.get("enabled", False):
+            global_market = data.get("global_market", {})
+            btc_dom = global_market.get("btc_dominance") if global_market else None
+            if btc_dom is not None:
+                prev_btc_dom = self.store.load_kv("btc_dom_prev", "__global__")
+                self.store.save_kv("btc_dom_prev", "__global__", float(btc_dom))
+
+                is_btc = (asset == "BTC")
+                threshold = float(btcd_rules.get("change_threshold_pct", 0.3))
+
+                if prev_btc_dom is not None and prev_btc_dom > 0:
+                    btcd_change = btc_dom - prev_btc_dom
+                    if btcd_change > threshold:
+                        # Rising BTC.D
+                        key = "btc_rising_score" if is_btc else "alt_rising_score"
+                        score += float(btcd_rules.get(key, 10))
+                        tag = "bullish" if is_btc else "bearish"
+                        details.append(f"BTC.D +{btcd_change:.1f}% {tag}")
+                    elif btcd_change < -threshold:
+                        # Falling BTC.D
+                        key = "btc_falling_score" if is_btc else "alt_falling_score"
+                        score += float(btcd_rules.get(key, 10))
+                        tag = "bearish" if is_btc else "alt season"
+                        details.append(f"BTC.D {btcd_change:.1f}% {tag}")
+                    else:
+                        key = "btc_stable_score" if is_btc else "alt_stable_score"
+                        score += float(btcd_rules.get(key, 10))
+                else:
+                    key = "btc_stable_score" if is_btc else "alt_stable_score"
+                    score += float(btcd_rules.get(key, 10))
 
         return min(100.0, max(0.0, score)), "; ".join(details) if details else "no market data"
 

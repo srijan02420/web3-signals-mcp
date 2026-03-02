@@ -36,14 +36,149 @@ agent_names:
   derivatives: "derivatives_agent"
 
 # ---------------------------------------------------------------------------
-# Composite score weights (must sum to 1.0)
+# Composite score weights
 # ---------------------------------------------------------------------------
+# Direction-aware asymmetric weighting: different weights for bullish vs bearish
+# leans, based on per-dimension accuracy data:
+#   whale:       bullish=27%, bearish=61%  → trust bearish only
+#   technical:   bullish=46%, bearish=64%  → trust bearish more
+#   derivatives: bullish=53%, bearish=42%  → trust bullish more
+#   narrative:   bullish=43%, bearish=52%  → weak everywhere
+#   market:      bullish=65%, bearish=51%  → trust bullish strongly
+#
+# How it works:
+#   1. Score all 5 dimensions (unchanged)
+#   2. Compute unweighted average of raw scores → "directional lean"
+#   3. If lean > 50 → use weights_bullish (optimised for bullish accuracy)
+#      If lean < 50 → use weights_bearish (optimised for bearish accuracy)
+#      If lean = 50 → use weights_default (fallback)
+#   4. Compute weighted composite with the selected weight set
+# ---------------------------------------------------------------------------
+weights_asymmetric:
+  enabled: true
+
+  # Default weights (fallback when lean is exactly neutral, or if disabled)
+  default:
+    whale: 0.20
+    technical: 0.30
+    derivatives: 0.25
+    narrative: 0.10
+    market: 0.15
+
+  # Weights when raw dimension average leans BULLISH (>50)
+  # Upweight dimensions with high bullish accuracy: market=65%, derivatives=53%
+  # Downweight dimensions with low bullish accuracy: whale=27%, narrative=43%
+  bullish:
+    whale: 0.05          # 27% bullish accuracy — nearly useless
+    technical: 0.25      # 46% — modest
+    derivatives: 0.30    # 53% — best bullish dimension
+    narrative: 0.10      # 43% — weak but low weight anyway
+    market: 0.30         # 65% — strongest bullish predictor
+
+  # Weights when raw dimension average leans BEARISH (<50)
+  # Upweight dimensions with high bearish accuracy: technical=64%, whale=61%
+  # Downweight dimensions with low bearish accuracy: derivatives=42%
+  bearish:
+    whale: 0.25          # 61% — strong bearish signal
+    technical: 0.35      # 64% — strongest bearish predictor
+    derivatives: 0.15    # 42% — weak for bearish
+    narrative: 0.10      # 52% — marginal
+    market: 0.15         # 51% — average
+
+# ---------------------------------------------------------------------------
+# Direction gating — zero out dimensions toxic in specific directions
+# ---------------------------------------------------------------------------
+# When a dimension has historically bad accuracy in a direction,
+# completely remove it (set weight to 0) rather than merely downweighting.
+# Freed weight is redistributed proportionally to remaining dimensions.
+#
+# Example: whale bullish=16% → actively harmful → gate it (zero weight)
+# ---------------------------------------------------------------------------
+direction_gating:
+  enabled: true
+  gates:
+    whale:
+      bullish_gate: true      # 16-27% bullish accuracy — actively harmful
+      bearish_gate: false     # 61% bearish — keep
+    technical:
+      bullish_gate: false     # 44% — keep
+      bearish_gate: false     # 62% — keep
+    derivatives:
+      bullish_gate: false     # 48% — keep
+      bearish_gate: false     # 37% — borderline, keep for now
+    narrative:
+      bullish_gate: false     # 54% — keep
+      bearish_gate: false     # 46% — keep
+    market:
+      bullish_gate: false     # 40% — borderline
+      bearish_gate: false     # 53% — keep
+
+# ---------------------------------------------------------------------------
+# Asset tier system — different scoring profiles for different asset classes
+# ---------------------------------------------------------------------------
+# Research (Baur 2018, Corbet 2019): BTC/ETH exhibit momentum, small-caps
+# exhibit mean reversion. Applying the same contrarian logic to all is wrong.
+#
+# Tiers override the base scoring.technical parameters per sub-component.
+# Only parameters that differ need to be specified; the rest inherit from base.
+# ---------------------------------------------------------------------------
+asset_tiers:
+  enabled: false                       # Disabled: 8-day bearish backtest window favours contrarian for all assets.
+                                       # Re-enable with regime detection or longer backtest data.
+
+  tiers:
+    momentum:                          # Tier 1: Large-cap momentum assets
+      assets: [BTC, ETH]
+    mild_contrarian:                   # Tier 2: Mid-cap mild contrarian
+      assets: [SOL, BNB, XRP, ADA, LINK, LTC, DOT]
+    contrarian:                        # Tier 3: Full contrarian (default)
+      assets: []                       # Everything not in other tiers
+
+  # Per-tier TECHNICAL scoring overrides (merged into base scoring.technical)
+  # NOTE: Full momentum flip worsened BTC/ETH in bearish market windows.
+  # Using NEUTRAL technical scoring for momentum tier: balanced, not contrarian.
+  technical_overrides:
+    momentum:
+      # NEUTRAL: balanced scoring — don't assume contrarian OR momentum
+      # In mixed/bearish markets, full momentum hurts. In bull markets, contrarian hurts.
+      # Split the difference: indicators score evenly in both directions.
+      rsi:
+        oversold_score: 25             # was 35 — dampened contrarian
+        overbought_score: 20           # was 10 — raised (not fully momentum either)
+        neutral_min_score: 20
+        neutral_max_score: 30
+      macd:
+        bullish_cross_points: 10       # was 5 — raised from contrarian
+        bearish_cross_points: 10       # was 15 — lowered, symmetric
+      ma:
+        above_ma7_points: 6            # was 3 — slightly raised
+        above_ma30_points: 6           # was 3
+        below_ma7_points: 6            # was 8 — slightly lowered
+        below_ma30_points: 6           # was 8
+      trend:
+        bullish_points: 10             # was 5 — raised, neutral
+        bearish_points: 10             # was 15 — lowered, neutral
+        neutral_points: 10
+
+    mild_contrarian:
+      # Dampened contrarian: less extreme than full contrarian
+      macd:
+        bullish_cross_points: 8        # was 5 — slightly raised
+        bearish_cross_points: 13       # was 15 — slightly lowered
+      trend:
+        bullish_points: 8              # was 5 — slightly raised
+        bearish_points: 13             # was 15 — slightly lowered
+        neutral_points: 10
+
+    # contrarian tier: no overrides — uses base scoring.technical as-is
+
+# Legacy flat weights (used when weights_asymmetric.enabled=false)
 weights:
-  whale: 0.20         # was 0.30 — lagging indicator
-  technical: 0.30     # was 0.25 — contrarian TA most predictive
-  derivatives: 0.25   # was 0.20 — combos predictive
-  narrative: 0.10     # was 0.15 — noisy
-  market: 0.15        # was 0.10 — F&G contrarian has value
+  whale: 0.20
+  technical: 0.30
+  derivatives: 0.25
+  narrative: 0.10
+  market: 0.15
 
 # ---------------------------------------------------------------------------
 # Score labels — evaluated top-down, first match wins
@@ -249,6 +384,24 @@ scoring:
       greed_below: 75
       greed_score: 10
       extreme_greed_score: 5
+
+    # BTC Dominance contribution (5-15 points)
+    # Rising BTC.D = money flowing to BTC from alts (bearish for alts)
+    # Falling BTC.D = money flowing from BTC to alts (bullish for alts)
+    # Data source: market agent → global_market.btc_dominance (from CoinGecko /global)
+    btc_dominance:
+      enabled: true
+      change_threshold_pct: 0.3        # minimum BTC.D change to be meaningful
+
+      # For BTC: rising dominance = bullish
+      btc_rising_score: 15             # BTC.D rising = bullish for BTC
+      btc_falling_score: 5             # BTC.D falling = bearish for BTC
+      btc_stable_score: 10
+
+      # For altcoins: rising dominance = bearish
+      alt_rising_score: 5              # BTC.D rising = bearish for alts
+      alt_falling_score: 15            # BTC.D falling = alt season
+      alt_stable_score: 10
 
 # ---------------------------------------------------------------------------
 # Dynamic reweighting — adjust ALL agent weights based on data availability
@@ -480,8 +633,8 @@ learning:
 # composite: final = absolute * absolute_weight + delta * delta_weight.
 delta_scoring:
   enabled: true
-  delta_weight: 0.4              # 40% weight to delta composite
-  absolute_weight: 0.6           # 60% weight to absolute composite
+  delta_weight: 0.15             # was 0.4 — at 15min intervals, deltas are ~neutral, dragging signals to 50
+  absolute_weight: 0.85          # was 0.6 — trust absolute composite more until interval increases
   thresholds:
     whale:       { significant: 15, major: 25 }
     technical:   { significant: 12, major: 20 }

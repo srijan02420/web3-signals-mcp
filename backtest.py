@@ -93,10 +93,44 @@ def binary_correct(direction: str, pct_change: float) -> bool:
 # ---------------------------------------------------------------------------
 SCORING_CFG = PROFILE.get("scoring", {})
 
+# ---------------------------------------------------------------------------
+# Asset tier helpers (for per-tier scoring overrides)
+# ---------------------------------------------------------------------------
+TIER_CFG = PROFILE.get("asset_tiers", {})
+
+
+def get_asset_tier(asset: str) -> str:
+    """Determine which tier an asset belongs to. Default: 'contrarian'."""
+    if not TIER_CFG.get("enabled", False):
+        return "contrarian"
+    for tier_name, tier_def in TIER_CFG.get("tiers", {}).items():
+        if asset in [a.upper() for a in tier_def.get("assets", [])]:
+            return tier_name
+    return "contrarian"
+
+
+def merge_rules(base: Dict, overrides: Dict) -> Dict:
+    """Shallow merge: for each key in overrides, if both are dicts, merge sub-keys."""
+    merged = dict(base)
+    for key, val in overrides.items():
+        if isinstance(val, dict) and isinstance(merged.get(key), dict):
+            merged[key] = {**merged[key], **val}
+        else:
+            merged[key] = val
+    return merged
+
 
 def score_technical(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
     """Score technical dimension for one asset using YAML rules."""
     rules = SCORING_CFG.get("technical", {})
+
+    # Apply asset tier overrides (momentum vs contrarian)
+    if TIER_CFG.get("enabled", False):
+        tier = get_asset_tier(asset)
+        overrides = TIER_CFG.get("technical_overrides", {}).get(tier, {})
+        if overrides:
+            rules = merge_rules(rules, overrides)
+
     by_asset = data.get("by_asset", {})
     asset_data = by_asset.get(asset, {})
     if not asset_data:
@@ -274,12 +308,26 @@ def score_derivatives(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
             details.append("high funding")
             funding_tier = "high"
 
-    # Open interest (simplified for backtest — no prev_oi state)
+    # Open interest — compare to previous value (mirrors engine.py KV logic)
     oi_rules = rules.get("open_interest", {})
     oi = asset_data.get("open_interest_usd") or asset_data.get("open_interest")
     if oi is not None:
-        # Can't compute change without previous OI in backtest, use stable
-        score += float(oi_rules.get("stable_score", 15))
+        prev_oi = prev_oi_by_asset.get(asset)
+        prev_oi_by_asset[asset] = float(oi)
+
+        if prev_oi is not None and prev_oi > 0:
+            oi_change_pct = ((float(oi) - prev_oi) / prev_oi) * 100
+            threshold = float(oi_rules.get("change_threshold_pct", 5))
+            if oi_change_pct > threshold:
+                score += float(oi_rules.get("rising_score", 25))
+                details.append(f"OI +{oi_change_pct:.1f}%")
+            elif oi_change_pct < -threshold:
+                score += float(oi_rules.get("falling_score", 10))
+                details.append(f"OI {oi_change_pct:.1f}%")
+            else:
+                score += float(oi_rules.get("stable_score", 15))
+        else:
+            score += float(oi_rules.get("stable_score", 15))
 
     # --- Combo scoring (Step 3 feature, YAML-driven) ---
     if ls_ratio is not None and funding_tier is not None:
@@ -449,8 +497,44 @@ def score_market(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
             score += float(fg_rules.get("extreme_greed_score", 5))
             details.append(f"F&G {fg:.0f} extreme greed")
 
+    # BTC Dominance (global, scored differently for BTC vs alts)
+    btcd_rules = rules.get("btc_dominance", {})
+    if btcd_rules.get("enabled", False):
+        global_market = data.get("global_market", {})
+        btc_dom = global_market.get("btc_dominance") if global_market else None
+        if btc_dom is not None:
+            prev_btc_dom = prev_btc_dom_val.get("__global__")
+            prev_btc_dom_val["__global__"] = float(btc_dom)
+
+            is_btc = (asset == "BTC")
+            threshold = float(btcd_rules.get("change_threshold_pct", 0.3))
+
+            if prev_btc_dom is not None and prev_btc_dom > 0:
+                btcd_change = btc_dom - prev_btc_dom
+                if btcd_change > threshold:
+                    key = "btc_rising_score" if is_btc else "alt_rising_score"
+                    score += float(btcd_rules.get(key, 10))
+                    tag = "bullish" if is_btc else "bearish"
+                    details.append(f"BTC.D +{btcd_change:.1f}% {tag}")
+                elif btcd_change < -threshold:
+                    key = "btc_falling_score" if is_btc else "alt_falling_score"
+                    score += float(btcd_rules.get(key, 10))
+                    tag = "bearish" if is_btc else "alt season"
+                    details.append(f"BTC.D {btcd_change:.1f}% {tag}")
+                else:
+                    key = "btc_stable_score" if is_btc else "alt_stable_score"
+                    score += float(btcd_rules.get(key, 10))
+            else:
+                key = "btc_stable_score" if is_btc else "alt_stable_score"
+                score += float(btcd_rules.get(key, 10))
+
     return min(100.0, max(0.0, score)), "; ".join(details) if details else "no market data"
 
+
+# ---------------------------------------------------------------------------
+# BTC dominance state tracking (mirrors engine.py's KV storage approach)
+# ---------------------------------------------------------------------------
+prev_btc_dom_val: Dict[str, float] = {}
 
 SCORERS = {
     "whale": score_whale,
@@ -508,10 +592,21 @@ def detect_data_tier(role: str, score: float, detail: str) -> str:
 # ---------------------------------------------------------------------------
 # Composite scoring (replicate engine.py fuse() logic)
 # ---------------------------------------------------------------------------
-WEIGHTS = PROFILE.get("weights", {})
+# Direction-aware asymmetric weighting
+ASYM_CFG = PROFILE.get("weights_asymmetric", {})
+ASYM_ENABLED = ASYM_CFG.get("enabled", False)
+WEIGHTS_DEFAULT = ASYM_CFG.get("default", PROFILE.get("weights", {}))
+WEIGHTS_BULLISH = ASYM_CFG.get("bullish", WEIGHTS_DEFAULT)
+WEIGHTS_BEARISH = ASYM_CFG.get("bearish", WEIGHTS_DEFAULT)
+if not ASYM_ENABLED:
+    WEIGHTS_DEFAULT = PROFILE.get("weights", {})
+    WEIGHTS_BULLISH = WEIGHTS_DEFAULT
+    WEIGHTS_BEARISH = WEIGHTS_DEFAULT
+
 LABEL_CFG = PROFILE.get("labels", [])
 CONVICTION_CFG = PROFILE.get("conviction", {})
 ABSTAIN_CFG = PROFILE.get("abstain", {})
+GATING_CFG = PROFILE.get("direction_gating", {})
 ALL_ROLES = ["whale", "technical", "derivatives", "narrative", "market"]
 
 
@@ -521,6 +616,11 @@ def classify(score: float) -> Tuple[str, str]:
             return entry.get("name", "UNKNOWN"), entry.get("direction", "neutral")
     return "STRONG SELL", "sell"
 
+
+# ---------------------------------------------------------------------------
+# OI state tracking (mirrors engine.py's KV storage approach)
+# ---------------------------------------------------------------------------
+prev_oi_by_asset: Dict[str, float] = {}
 
 DELTA_CFG = PROFILE.get("delta_scoring", {})
 
@@ -566,8 +666,36 @@ def compute_composite(
             s, d = raw_scores[role]
             data_tiers[role] = detect_data_tier(role, s, d)
 
+    # Direction-aware weight selection
+    raw_avg = sum(raw_scores[r][0] for r in ALL_ROLES) / len(ALL_ROLES)
+    if ASYM_ENABLED:
+        if raw_avg > 50:
+            selected_weights = WEIGHTS_BULLISH
+        elif raw_avg < 50:
+            selected_weights = WEIGHTS_BEARISH
+        else:
+            selected_weights = WEIGHTS_DEFAULT
+    else:
+        selected_weights = WEIGHTS_DEFAULT
+
     # Adjusted weights
-    base_weights = {role: float(WEIGHTS.get(role, 0.0)) for role in ALL_ROLES}
+    base_weights = {role: float(selected_weights.get(role, 0.0)) for role in ALL_ROLES}
+
+    # Direction gating: zero out dimensions toxic in specific directions
+    if GATING_CFG.get("enabled", False):
+        gates = GATING_CFG.get("gates", {})
+        direction_lean = "bullish" if raw_avg > 50 else "bearish" if raw_avg < 50 else "neutral"
+        for role in ALL_ROLES:
+            role_gates = gates.get(role, {})
+            gate_key = f"{direction_lean}_gate"
+            if role_gates.get(gate_key, False):
+                base_weights[role] = 0.0
+        # Renormalize to sum to 1.0
+        total_w = sum(base_weights.values())
+        if total_w > 0:
+            for role in ALL_ROLES:
+                base_weights[role] = base_weights[role] / total_w
+
     adjusted_weights: Dict[str, float] = {}
     total_freed = 0.0
     full_data_roles: List[str] = []
@@ -817,6 +945,7 @@ def run_backtest():
     print(f"Conviction: {'enabled' if CONVICTION_CFG.get('enabled', True) else 'DISABLED'}")
     print(f"Abstain: {'enabled' if ABSTAIN_CFG.get('enabled', False) else 'disabled'}")
     print(f"Reweighting: {'enabled' if REWEIGHT_ENABLED else 'disabled'}")
+    print(f"Asymmetric weights: {'ENABLED' if ASYM_ENABLED else 'disabled'}")
     print("=" * 80)
 
     # Map role names to agent storage names
@@ -867,6 +996,8 @@ def run_backtest():
 
     all_signals: List[Dict] = []
     prev_dims_by_asset: Dict[str, Dict] = {}  # Track previous dimensions for delta scoring
+    prev_oi_by_asset.clear()  # Reset OI state for clean backtest run
+    prev_btc_dom_val.clear()  # Reset BTC dominance state for clean backtest run
     for ts, snapshot in aligned:
         for asset in assets_list:
             result = compute_composite(asset, snapshot, prev_dims_by_asset.get(asset))
@@ -920,7 +1051,13 @@ def run_backtest():
     print(f"\n  Mean:   {avg_score:.1f}  |  Median: {median_score:.1f}  |  Min: {min_score:.1f}  |  Max: {max_score:.1f}")
 
     # Show YAML weights for reference
-    print(f"\n  YAML weights: " + ", ".join(f"{r}={WEIGHTS.get(r, 0)}" for r in ALL_ROLES))
+    if ASYM_ENABLED:
+        print(f"\n  Asymmetric weighting: ENABLED")
+        print(f"    Default:  " + ", ".join(f"{r}={WEIGHTS_DEFAULT.get(r, 0)}" for r in ALL_ROLES))
+        print(f"    Bullish:  " + ", ".join(f"{r}={WEIGHTS_BULLISH.get(r, 0)}" for r in ALL_ROLES))
+        print(f"    Bearish:  " + ", ".join(f"{r}={WEIGHTS_BEARISH.get(r, 0)}" for r in ALL_ROLES))
+    else:
+        print(f"\n  YAML weights: " + ", ".join(f"{r}={WEIGHTS_DEFAULT.get(r, 0)}" for r in ALL_ROLES))
 
     # ================================================================
     # PART 2: Forward-looking accuracy backtest
@@ -1170,10 +1307,12 @@ def run_backtest():
 
   Config: conviction={'enabled' if CONVICTION_CFG.get('enabled', True) else 'DISABLED'}
           abstain={'enabled' if ABSTAIN_CFG.get('enabled', False) else 'disabled'}
-          weights={dict(WEIGHTS)}
+          asymmetric_weights={'ENABLED' if ASYM_ENABLED else 'disabled'}
+          weights_default={dict(WEIGHTS_DEFAULT)}
 
   Baseline (old YAML): 25.6%
-  Target:              >50%
+  Previous best:       52.5%
+  Target:              >60%
 
   Scale:
     >60% = Good (beating random by 2x)
