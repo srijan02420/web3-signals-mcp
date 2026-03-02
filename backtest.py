@@ -1067,8 +1067,8 @@ def run_backtest():
     print(f"{'='*80}")
     print("For each directional signal, look up actual price N hours later.\n")
 
-    windows = [24, 48, 168]
-    window_labels = {24: "24h", 48: "48h", 168: "7d"}
+    windows = [24, 48]
+    window_labels = {24: "24h", 48: "48h"}
 
     # Deduplicate: one signal per asset per ~12h window
     seen_buckets = set()
