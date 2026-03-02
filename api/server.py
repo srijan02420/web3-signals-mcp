@@ -169,7 +169,7 @@ if _X402_ENABLED:
         "GET /performance/reputation": X402RouteConfig(
             accepts=[_payment_option],
             description=(
-                "30-day rolling signal accuracy: hit/miss at 24h/48h/7d windows, "
+                "30-day rolling signal accuracy at 24h/48h windows, "
                 "per-asset breakdown. Verifiable reputation score."
             ),
             mime_type="application/json",
@@ -433,7 +433,7 @@ def _calculate_gradient_score(
 
 def _evaluate_old_snapshots(store: Storage) -> None:
     """
-    Check snapshots that are 24h/48h/7d old and evaluate accuracy.
+    Check snapshots that are 24h/48h old and evaluate accuracy.
     Uses gradient scoring: 0.0-1.0 based on direction AND magnitude.
     Reuses prices already stored by the market agent (no extra API call).
     """
@@ -459,8 +459,8 @@ def _evaluate_old_snapshots(store: Storage) -> None:
     if _fusion and hasattr(_fusion, "profile"):
         accuracy_cfg = _fusion.profile.get("accuracy", {})
 
-    # Evaluate each window: 24h, 48h, 7d (168h)
-    windows = [(24, 24), (48, 48), (168, 168)]
+    # Evaluate each window: 24h, 48h
+    windows = [(24, 24), (48, 48)]
     total_evaluated = 0
 
     for window_hours, min_age in windows:
@@ -838,7 +838,7 @@ async def get_reputation():
             "accuracy_formula": "AVG(gradient_score) × 100",
             "noise_threshold": "±2% — moves within this range are inconclusive",
             "window": "30-day rolling",
-            "timeframes": ["24h", "48h", "7d"],
+            "timeframes": ["24h", "48h"],
             "price_source": "market agent (CoinGecko + Binance)",
         },
         "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -983,7 +983,7 @@ async def agent_card():
             },
             {
                 "name": "get_reputation",
-                "description": "Get public reputation score — rolling 30-day signal accuracy across 24h/48h/7d timeframes, per-asset breakdown",
+                "description": "Get public reputation score — rolling 30-day signal accuracy across 24h/48h timeframes, per-asset breakdown",
                 "endpoint": f"{base_url}/performance/reputation",
                 "method": "GET",
             },
