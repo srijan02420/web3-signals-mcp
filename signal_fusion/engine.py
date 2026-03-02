@@ -42,12 +42,40 @@ class SignalFusion:
                 errors.append(f"{role}: no data in storage")
 
         # Score each asset across all dimensions
+        # Try loading learned weights from optimizer; fall back to YAML
         weights = self.profile.get("weights", {})
+        learning_cfg = self.profile.get("learning", {})
+        if learning_cfg.get("enabled", False):
+            try:
+                from signal_fusion.optimizer import WeightOptimizer
+                optimizer = WeightOptimizer(self.store, self.profile)
+                learned = optimizer.get_current_weights()
+                if learned:
+                    weights = learned
+                    errors.append(f"using learned weights: {learned}")
+            except Exception as exc:
+                errors.append(f"optimizer load failed: {exc}")
+
         scoring_cfg = self.profile.get("scoring", {})
         label_cfg = self.profile.get("labels", [])
 
         signals: Dict[str, Dict[str, Any]] = {}
         all_roles = ["whale", "technical", "derivatives", "narrative", "market"]
+
+        # Load delta scorer (YAML-driven change detection)
+        delta_scorer = None
+        prev_signals: Dict[str, Dict] = {}
+        delta_cfg = self.profile.get("delta_scoring", {})
+        if delta_cfg.get("enabled", False):
+            try:
+                from signal_fusion.delta import DeltaScorer
+                delta_scorer = DeltaScorer(self.profile)
+                # Load previous fusion run's signals for delta comparison
+                prev_run = self.store.load_latest("signal_fusion")
+                if prev_run:
+                    prev_signals = prev_run.get("data", {}).get("signals", {})
+            except Exception as exc:
+                errors.append(f"delta scorer: {exc}")
 
         # Dynamic reweighting config (from YAML)
         reweight_cfg = self.profile.get("reweighting", {})
@@ -153,7 +181,31 @@ class SignalFusion:
                 bearish_count = 0
                 conviction_applied = False
 
-            label_name, direction = self._classify(composite, label_cfg)
+            # --- Phase 5b: Delta (change-detection) scoring ---
+            # Blend absolute composite with delta composite based on dimension changes.
+            delta_details = {}
+            if delta_scorer and delta_scorer.is_enabled():
+                prev_dims = prev_signals.get(asset, {}).get("dimensions")
+                delta_composite, delta_details = delta_scorer.compute_delta_composite(
+                    asset, dimensions, prev_dims
+                )
+                if delta_composite is not None:
+                    composite = delta_scorer.blend(composite, delta_composite)
+
+            # --- Phase 6: Abstain check ---
+            # When composite is too close to 50 (no edge), force neutral.
+            abstain_cfg = self.profile.get("abstain", {})
+            abstain_applied = False
+            if abstain_cfg.get("enabled", False):
+                min_distance = float(abstain_cfg.get("min_distance_from_center", 8))
+                if abs(composite - 50.0) < min_distance:
+                    abstain_applied = True
+                    label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
+                    direction = "neutral"
+                else:
+                    label_name, direction = self._classify(composite, label_cfg)
+            else:
+                label_name, direction = self._classify(composite, label_cfg)
 
             # Momentum vs previous run
             prev_score = self.store.load_kv("fusion_scores", asset)
@@ -179,6 +231,8 @@ class SignalFusion:
                 "prev_score": round(prev_score, 1) if prev_score is not None else None,
                 "data_tiers": data_tiers,
                 "conviction_boost": conviction_applied,
+                "abstain": abstain_applied,
+                "delta": delta_details if delta_details else None,
             }
 
             # Store current score for next momentum comparison
@@ -407,43 +461,58 @@ class SignalFusion:
         score = 0.0
         details: List[str] = []
 
-        # Long/short ratio
+        # Long/short ratio — with very_overcrowded tier (YAML-driven)
         ls_rules = rules.get("long_short", {})
         ls_ratio = asset_data.get("long_short_ratio")
+        ls_tier = None  # Track for combo scoring
         if ls_ratio is not None:
             sweet_min = float(ls_rules.get("sweet_spot_min", 0.55))
             sweet_max = float(ls_rules.get("sweet_spot_max", 0.65))
+            very_overcrowded = float(ls_rules.get("very_overcrowded_above", 999))
             overcrowded = float(ls_rules.get("overcrowded_above", 0.70))
             contrarian = float(ls_rules.get("contrarian_below", 0.45))
 
-            if sweet_min <= ls_ratio <= sweet_max:
+            if ls_ratio > very_overcrowded:
+                score += float(ls_rules.get("very_overcrowded_score", 3))
+                details.append(f"L/S {ls_ratio:.2f} very overcrowded")
+                ls_tier = "very_overcrowded"
+            elif sweet_min <= ls_ratio <= sweet_max:
                 score += float(ls_rules.get("sweet_spot_score", 40))
                 details.append(f"L/S {ls_ratio:.2f} sweet spot")
+                ls_tier = "sweet_spot"
             elif ls_ratio > overcrowded:
                 score += float(ls_rules.get("overcrowded_score", 10))
                 details.append(f"L/S {ls_ratio:.2f} overcrowded")
+                ls_tier = "overcrowded"
             elif ls_ratio < contrarian:
                 score += float(ls_rules.get("contrarian_score", 35))
                 details.append(f"L/S {ls_ratio:.2f} contrarian")
+                ls_tier = "contrarian"
             else:
                 score += float(ls_rules.get("default_score", 25))
                 details.append(f"L/S {ls_ratio:.2f}")
+                ls_tier = "default"
 
         # Funding rate
         fund_rules = rules.get("funding", {})
         funding = asset_data.get("funding_rate")
+        funding_tier = None  # Track for combo scoring
         if funding is not None:
             if funding < 0:
                 score += float(fund_rules.get("negative_score", 35))
                 details.append(f"funding {funding:.5f} negative")
+                funding_tier = "negative"
             elif funding < float(fund_rules.get("low_threshold", 0.0002)):
                 score += float(fund_rules.get("low_score", 30))
                 details.append("low funding")
+                funding_tier = "low"
             elif funding < float(fund_rules.get("moderate_threshold", 0.0005)):
                 score += float(fund_rules.get("moderate_score", 15))
+                funding_tier = "moderate"
             else:
                 score += float(fund_rules.get("high_score", 5))
                 details.append("high funding")
+                funding_tier = "high"
 
         # Open interest — compare to previous run to detect rising/falling
         oi_rules = rules.get("open_interest", {})
@@ -466,6 +535,20 @@ class SignalFusion:
             else:
                 score += float(oi_rules.get("stable_score", 15))
 
+        # --- Combo signals (YAML-driven cross-indicator patterns) ---
+        if ls_tier is not None and funding_tier is not None:
+            # Overcrowded longs + high funding = crash risk
+            combo_penalty = float(rules.get("combo_overcrowded_high_funding_penalty", 0))
+            if ls_tier in ("overcrowded", "very_overcrowded") and funding_tier == "high" and combo_penalty != 0:
+                score += combo_penalty
+                details.append("combo: overcrowded+high_funding")
+
+            # Contrarian shorts + negative funding = squeeze setup
+            combo_bonus = float(rules.get("combo_contrarian_negative_funding_bonus", 0))
+            if ls_tier == "contrarian" and funding_tier == "negative" and combo_bonus != 0:
+                score += combo_bonus
+                details.append("combo: contrarian+neg_funding")
+
         return min(100.0, max(0.0, score)), "; ".join(details) if details else "no deriv data"
 
     # ================================================================ #
@@ -479,17 +562,33 @@ class SignalFusion:
             return 50.0, "no data"
 
         details: List[str] = []
-        score = 0.0
+
+        # Base score (YAML-configurable, allows contrarian penalties room)
+        score = float(rules.get("narrative_base_score", 0))
 
         # --- Component 1: Volume score (0-30 points) ---
-        # Uses normalised_score (0.0-1.0 vs rolling peak) * multiplier
+        # When volume_invert=true, high mentions → LOW score (contrarian)
         raw_score = float(asset_data.get("normalised_score", 0.0))
         volume_mult = float(rules.get("volume_multiplier", 30))
-        volume_pts = raw_score * volume_mult
+        volume_invert = rules.get("volume_invert", False)
+
+        if volume_invert:
+            volume_pts = (1.0 - raw_score) * volume_mult
+        else:
+            volume_pts = raw_score * volume_mult
         score += volume_pts
+
         if raw_score > 0:
             total_mentions = int(asset_data.get("total_mentions", 0))
-            details.append(f"vol {raw_score:.2f} ({total_mentions} mentions)")
+            inv_tag = " [inv]" if volume_invert else ""
+            details.append(f"vol {raw_score:.2f}{inv_tag} ({total_mentions} mentions)")
+
+        # Quiet bonus: low mentions = opportunity (contrarian)
+        quiet_threshold = float(rules.get("quiet_threshold", 0))
+        quiet_bonus = float(rules.get("quiet_bonus", 0))
+        if quiet_threshold > 0 and raw_score < quiet_threshold and quiet_bonus != 0:
+            score += quiet_bonus
+            details.append("quiet")
 
         # --- Component 2: LLM sentiment (0-25 points) ---
         llm_data = asset_data.get("llm_sentiment")
@@ -521,14 +620,17 @@ class SignalFusion:
                 bear = community.get("bearish", 0)
                 details.append(f"community {bull}B/{bear}S")
 
-        # --- Component 4: Trending bonus (0-10 points) ---
+        # --- Component 4: Trending bonus (can be NEGATIVE for contrarian) ---
         trending = asset_data.get("trending_coingecko", False)
         trending_bonus = float(rules.get("trending_bonus", 10))
         if trending:
             score += trending_bonus
-            details.append("trending")
+            if trending_bonus < 0:
+                details.append("trending [contrarian]")
+            else:
+                details.append("trending")
 
-        # --- Component 5: Influencer bonus (0-10 points) ---
+        # --- Component 5: Influencer bonus ---
         inf_count = int(asset_data.get("influencer_mentions", 0))
         inf_threshold = int(rules.get("influencer_threshold", 2))
         inf_bonus = float(rules.get("influencer_bonus", 10))
@@ -540,7 +642,7 @@ class SignalFusion:
             else:
                 details.append(f"{inf_count} influencers")
 
-        # --- Component 6: Multi-source confirmation (0-10 points) ---
+        # --- Component 6: Multi-source confirmation ---
         sources_with_data = int(asset_data.get("sources_with_data", 0))
         multi_threshold = int(rules.get("multi_source_threshold", 3))
         multi_bonus = float(rules.get("multi_source_bonus", 10))

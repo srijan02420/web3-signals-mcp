@@ -296,6 +296,27 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 print(f"  [PERF] Running accuracy evaluation...")
                 _evaluate_old_snapshots(store)
                 store.save_kv("perf_eval", "last_run", now_ts)
+
+                # Trigger weight optimizer after evaluation
+                try:
+                    from shared.profile_loader import load_profile
+                    from signal_fusion.optimizer import WeightOptimizer
+                    from pathlib import Path
+
+                    profile_path = Path(__file__).resolve().parent.parent / "signal_fusion" / "profiles" / "default.yaml"
+                    profile = load_profile(profile_path)
+                    optimizer = WeightOptimizer(store, profile)
+
+                    if optimizer.is_enabled() and optimizer.should_optimize():
+                        print(f"  [LEARN] Running weight optimization...")
+                        new_weights = optimizer.compute_and_apply()
+                        if new_weights:
+                            print(f"  [LEARN] Updated weights: {new_weights}")
+                        else:
+                            print(f"  [LEARN] Not enough data for optimization yet")
+                except Exception as opt_exc:
+                    print(f"  weight optimizer: {opt_exc}")
+
         except Exception as exc:
             print(f"  performance eval: {exc}")
 
