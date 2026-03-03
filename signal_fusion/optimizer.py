@@ -34,7 +34,7 @@ class WeightOptimizer:
         self.cfg = profile.get("learning", {})
         self.enabled = self.cfg.get("enabled", False)
         self.namespace = self.cfg.get("state_namespace", "learning_optimizer")
-        self.all_roles = ["whale", "technical", "derivatives", "narrative", "market"]
+        self.all_roles = ["whale", "technical", "derivatives", "narrative", "market", "trend"]
 
     def is_enabled(self) -> bool:
         return self.enabled

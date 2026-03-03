@@ -27,7 +27,7 @@ class DeltaScorer:
     def __init__(self, profile: Dict[str, Any]) -> None:
         self.cfg = profile.get("delta_scoring", {})
         self.enabled = self.cfg.get("enabled", False)
-        self.all_roles = ["whale", "technical", "derivatives", "narrative", "market"]
+        self.all_roles = ["whale", "technical", "derivatives", "narrative", "market", "trend"]
 
     def is_enabled(self) -> bool:
         return self.enabled

@@ -334,7 +334,8 @@ def _record_performance_snapshot(store: Storage) -> None:
     """
     Record performance snapshots — max 1 per asset per 12 hours.
     This avoids inflating sample size with near-identical correlated snapshots.
-    Direction is derived from composite_score: >60 bullish, <40 bearish, else neutral.
+    Direction comes directly from the fusion engine output (which accounts for
+    abstain zones and YAML label thresholds).
     """
     import re as _re
 
@@ -361,10 +362,13 @@ def _record_performance_snapshot(store: Storage) -> None:
         if price is None or score is None:
             continue
 
-        # Derive direction from score threshold (matches YAML label bands)
-        if score >= 55:
+        # Use the fusion engine's direction directly — it already accounts
+        # for abstain zones (42-58) and YAML label thresholds.
+        # Map fusion directions: "buy" → "bullish", "sell" → "bearish", "neutral" → "neutral"
+        fusion_direction = sig.get("direction", "neutral")
+        if fusion_direction == "buy":
             direction = "bullish"
-        elif score < 45:
+        elif fusion_direction == "sell":
             direction = "bearish"
         else:
             direction = "neutral"
@@ -548,7 +552,7 @@ app = FastAPI(
         "Fuses whale activity, derivatives positioning, technical analysis, "
         "narrative momentum, and market data into scored signals with LLM insights."
     ),
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -605,7 +609,7 @@ if _X402_ENABLED:
 async def root():
     response = {
         "name": "Web3 Signals API",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "description": "AI-powered crypto signal intelligence for 20 assets",
         "endpoints": {
             "/dashboard": "Live signal intelligence dashboard (open in browser)",
@@ -825,8 +829,20 @@ async def get_reputation():
         "by_asset": stats["by_asset"],
         "snapshots_collected_30d": total_snapshots,
         "methodology": {
-            "direction_extraction": "score >=55 = bullish, <45 = bearish, 45-55 = neutral",
-            "neutral_handling": "neutral signals are NOT evaluated — only directional calls count",
+            "direction_extraction": (
+                "from fusion engine: direction comes from YAML label thresholds. "
+                "Abstain zone is DYNAMIC based on Fear & Greed index: "
+                "extreme fear/greed → threshold=5 (zone 45-55), "
+                "moderate fear/greed → threshold=6 (zone 44-56), "
+                "neutral → threshold=10 (zone 40-60). "
+                "Signals in the abstain zone are labelled INSUFFICIENT EDGE and skipped."
+            ),
+            "trend_override": (
+                "When BTC is >5% below its 30-day MA (confirmed downtrend), "
+                "contrarian boost on market and derivatives dimensions is dampened by 30%. "
+                "This allows bearish signals to emerge in sustained bear markets."
+            ),
+            "neutral_handling": "neutral/abstain signals are NOT evaluated — only directional calls count",
             "scoring": "gradient (0.0-1.0) based on direction AND magnitude",
             "gradient_scale": {
                 "1.0": "strong move (>5%) in predicted direction",
@@ -967,7 +983,7 @@ async def agent_card():
             "Includes LLM-generated cross-dimensional insights."
         ),
         "url": base_url,
-        "version": "0.1.0",
+        "version": "0.2.0",
         "capabilities": [
             {
                 "name": "get_all_signals",

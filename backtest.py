@@ -435,12 +435,12 @@ def score_narrative(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
 
 
 def score_market(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
-    """Score market dimension for one asset using YAML rules."""
+    """Score market dimension for one asset using YAML rules. Bipolar (centered at 50)."""
     rules = SCORING_CFG.get("market", {})
     per_asset = data.get("per_asset", {})
     asset_data = per_asset.get(asset, {})
     details: List[str] = []
-    score = 0.0
+    score = float(rules.get("base_score", 0.0))  # Bipolar: start at 50
 
     # Price change
     pc_rules = rules.get("price_change", {})
@@ -451,16 +451,16 @@ def score_market(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
         mild_neg = float(pc_rules.get("mild_negative_above", -5.0))
 
         if change_24h > strong_pos:
-            score += float(pc_rules.get("strong_positive_score", 40))
+            score += float(pc_rules.get("strong_positive_score", -5))
             details.append(f"+{change_24h:.1f}% strong")
         elif change_24h > pos:
-            score += float(pc_rules.get("positive_score", 30))
+            score += float(pc_rules.get("positive_score", 0))
             details.append(f"+{change_24h:.1f}%")
         elif change_24h > mild_neg:
-            score += float(pc_rules.get("mild_negative_score", 20))
+            score += float(pc_rules.get("mild_negative_score", 5))
             details.append(f"{change_24h:.1f}%")
         else:
-            score += float(pc_rules.get("strong_negative_score", 10))
+            score += float(pc_rules.get("strong_negative_score", 8))
             details.append(f"{change_24h:.1f}% drop")
 
     # Volume spike
@@ -528,6 +528,27 @@ def score_market(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
                 key = "btc_stable_score" if is_btc else "alt_stable_score"
                 score += float(btcd_rules.get(key, 10))
 
+    # Trend awareness penalty: fear + price drop confirming = genuine downtrend
+    ta_rules = rules.get("trend_awareness", {})
+    if ta_rules.get("enabled", False):
+        fg_t = float(ta_rules.get("fg_threshold", 35))
+        drop_t = float(ta_rules.get("drop_threshold", -2.0))
+        max_pen = float(ta_rules.get("max_penalty", -30))
+
+        sentiment = data.get("sentiment", {})
+        fg_val = sentiment.get("fear_greed_index")
+        chg = asset_data.get("change_24h_pct")
+
+        if fg_val is not None and chg is not None:
+            fg_f = float(fg_val)
+            chg_f = float(chg)
+            if fg_f < fg_t and chg_f < drop_t:
+                fg_intensity = (fg_t - fg_f) / fg_t
+                drop_intensity = min(abs(chg_f) / 10.0, 1.0)
+                penalty = fg_intensity * drop_intensity * max_pen
+                score += penalty
+                details.append(f"downtrend penalty {penalty:.0f}")
+
     return min(100.0, max(0.0, score)), "; ".join(details) if details else "no market data"
 
 
@@ -536,12 +557,99 @@ def score_market(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
 # ---------------------------------------------------------------------------
 prev_btc_dom_val: Dict[str, float] = {}
 
+def score_trend(asset: str, data: Dict[str, Any], market_data: Optional[Dict[str, Any]] = None) -> Tuple[float, str]:
+    """Score trend dimension for one asset using YAML rules. PRO-TREND (not contrarian)."""
+    rules = SCORING_CFG.get("trend", {})
+    by_asset = data.get("by_asset", {})
+    asset_data = by_asset.get(asset, {})
+    details: List[str] = []
+    score = 50.0  # Start neutral
+
+    # Market data for price change
+    market_asset_data = {}
+    if market_data:
+        market_asset_data = market_data.get("per_asset", {}).get(asset, {})
+
+    # Component 1: MA Alignment
+    ma_rules = rules.get("ma_alignment", {})
+    price = asset_data.get("price")
+    ma_7d = asset_data.get("ma_7d")
+    ma_30d = asset_data.get("ma_30d")
+
+    if price is not None and ma_7d is not None and ma_30d is not None:
+        if price > ma_7d and ma_7d > ma_30d:
+            score += float(ma_rules.get("bullish_chain_score", 15))
+            details.append("MA bullish chain")
+        elif price < ma_7d and ma_7d < ma_30d:
+            score += float(ma_rules.get("bearish_chain_score", -15))
+            details.append("MA bearish chain")
+        elif price > ma_30d:
+            score += float(ma_rules.get("partial_bullish_score", 8))
+            details.append("above MA30")
+        elif price < ma_30d:
+            score += float(ma_rules.get("partial_bearish_score", -8))
+            details.append("below MA30")
+
+    # Component 2: RSI Momentum (pro-trend)
+    rsi_rules = rules.get("rsi_momentum", {})
+    rsi = asset_data.get("rsi_14")
+    if rsi is not None:
+        if rsi > float(rsi_rules.get("strong_bullish_above", 65)):
+            score += float(rsi_rules.get("strong_bullish_score", 12))
+            details.append(f"RSI {rsi:.0f} strong momentum")
+        elif rsi > float(rsi_rules.get("bullish_above", 55)):
+            score += float(rsi_rules.get("bullish_score", 6))
+            details.append(f"RSI {rsi:.0f} momentum")
+        elif rsi < float(rsi_rules.get("strong_bearish_below", 35)):
+            score += float(rsi_rules.get("strong_bearish_score", -12))
+            details.append(f"RSI {rsi:.0f} strong downward")
+        elif rsi < float(rsi_rules.get("bearish_below", 45)):
+            score += float(rsi_rules.get("bearish_score", -6))
+            details.append(f"RSI {rsi:.0f} downward")
+
+    # Component 3: Price Change Direction (pro-trend)
+    pc_rules = rules.get("price_change", {})
+    change_24h = market_asset_data.get("change_24h_pct")
+    if change_24h is not None:
+        if change_24h > float(pc_rules.get("strong_positive_above", 5.0)):
+            score += float(pc_rules.get("strong_positive_score", 10))
+            details.append(f"+{change_24h:.1f}% strong up")
+        elif change_24h > float(pc_rules.get("positive_above", 1.0)):
+            score += float(pc_rules.get("positive_score", 5))
+            details.append(f"+{change_24h:.1f}%")
+        elif change_24h < float(pc_rules.get("strong_negative_below", -5.0)):
+            score += float(pc_rules.get("strong_negative_score", -10))
+            details.append(f"{change_24h:.1f}% strong down")
+        elif change_24h < float(pc_rules.get("negative_below", -1.0)):
+            score += float(pc_rules.get("negative_score", -5))
+            details.append(f"{change_24h:.1f}%")
+
+    # Component 4: Trend Strength (distance from MA30)
+    strength_rules = rules.get("trend_strength", {})
+    if price is not None and ma_30d is not None and ma_30d > 0:
+        pct_from_ma = ((price - ma_30d) / ma_30d) * 100
+        strong_above = float(strength_rules.get("strong_above_pct", 10))
+        strong_below = float(strength_rules.get("strong_below_pct", -10))
+        max_bonus = float(strength_rules.get("max_bonus", 8))
+        max_penalty = float(strength_rules.get("max_penalty", -8))
+        if pct_from_ma > 0:
+            intensity = min(pct_from_ma / strong_above, 1.0)
+            score += intensity * max_bonus
+        else:
+            intensity = min(abs(pct_from_ma) / abs(strong_below), 1.0)
+            score += intensity * max_penalty
+
+    score = max(0.0, min(100.0, score))
+    return score, "; ".join(details) if details else "no trend data"
+
+
 SCORERS = {
     "whale": score_whale,
     "technical": score_technical,
     "derivatives": score_derivatives,
     "narrative": score_narrative,
     "market": score_market,
+    "trend": score_trend,
 }
 
 
@@ -606,8 +714,8 @@ if not ASYM_ENABLED:
 LABEL_CFG = PROFILE.get("labels", [])
 CONVICTION_CFG = PROFILE.get("conviction", {})
 ABSTAIN_CFG = PROFILE.get("abstain", {})
-GATING_CFG = PROFILE.get("direction_gating", {})
-ALL_ROLES = ["whale", "technical", "derivatives", "narrative", "market"]
+SCALING_CFG = PROFILE.get("accuracy_scaling", {})
+ALL_ROLES = ["whale", "technical", "derivatives", "narrative", "market", "trend"]
 
 
 def classify(score: float) -> Tuple[str, str]:
@@ -634,16 +742,67 @@ def _get_delta_scorer():
     return _delta_scorer
 
 
+REGIME_CFG = PROFILE.get("regime_weighting", {})
+CONFIDENCE_CFG = PROFILE.get("confidence", {})
+
+
+def detect_regime(snapshot: Dict[str, Optional[Dict[str, Any]]]) -> Tuple[str, Dict[str, float]]:
+    """Detect market regime (trending/ranging/unknown) from BTC data."""
+    if not REGIME_CFG.get("enabled", False):
+        return "unknown", {}
+
+    det_cfg = REGIME_CFG.get("detection", {})
+    trending_t = float(det_cfg.get("trending_threshold", 0.08))
+    ranging_t = float(det_cfg.get("ranging_threshold", 0.03))
+
+    tech_data = snapshot.get("technical")
+    market_data = snapshot.get("market")
+
+    btc_price = None
+    btc_ma30 = None
+    btc_ma7 = None
+
+    if market_data:
+        btc_price = market_data.get("data", {}).get("per_asset", {}).get("BTC", {}).get("price")
+    if tech_data:
+        btc_ma30 = tech_data.get("data", {}).get("by_asset", {}).get("BTC", {}).get("ma_30d")
+        btc_ma7 = tech_data.get("data", {}).get("by_asset", {}).get("BTC", {}).get("ma_7d")
+
+    if btc_price is None or btc_ma30 is None or btc_ma30 <= 0:
+        return "unknown", {}
+
+    pct_from_ma30 = abs((btc_price - btc_ma30) / btc_ma30)
+    ma_aligned = True
+    if det_cfg.get("require_ma_alignment", True) and btc_ma7 is not None:
+        price_above = btc_price > btc_ma30
+        ma7_above = btc_ma7 > btc_ma30
+        ma_aligned = (price_above == ma7_above)
+
+    if pct_from_ma30 > trending_t and ma_aligned:
+        shifts = {k: float(v) for k, v in REGIME_CFG.get("trending", {}).items()}
+        return "trending", shifts
+    elif pct_from_ma30 < ranging_t:
+        shifts = {k: float(v) for k, v in REGIME_CFG.get("ranging", {}).items()}
+        return "ranging", shifts
+
+    return "unknown", {}
+
+
 def compute_composite(
     asset: str,
     agent_snapshots: Dict[str, Optional[Dict[str, Any]]],
     prev_dimensions: Optional[Dict[str, Dict[str, Any]]] = None,
+    regime_shifts: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Re-score a single asset using current YAML config. Returns signal dict."""
 
     raw_scores: Dict[str, Tuple[float, str]] = {}
     for role in ALL_ROLES:
-        agent_data = agent_snapshots.get(role)
+        # Trend dimension reads from technical agent (no dedicated trend agent)
+        if role == "trend":
+            agent_data = agent_snapshots.get("technical")
+        else:
+            agent_data = agent_snapshots.get(role)
         if agent_data is None:
             raw_scores[role] = (50.0, "no data")
         else:
@@ -651,7 +810,13 @@ def compute_composite(
             scorer = SCORERS.get(role)
             if scorer:
                 try:
-                    raw_scores[role] = scorer(asset, data)
+                    if role == "trend":
+                        # Trend scorer needs market data too
+                        market_snap = agent_snapshots.get("market")
+                        market_data = market_snap.get("data", {}) if market_snap else None
+                        raw_scores[role] = scorer(asset, data, market_data)
+                    else:
+                        raw_scores[role] = scorer(asset, data)
                 except Exception as e:
                     raw_scores[role] = (50.0, f"error: {e}")
             else:
@@ -681,16 +846,27 @@ def compute_composite(
     # Adjusted weights
     base_weights = {role: float(selected_weights.get(role, 0.0)) for role in ALL_ROLES}
 
-    # Direction gating: zero out dimensions toxic in specific directions
-    if GATING_CFG.get("enabled", False):
-        gates = GATING_CFG.get("gates", {})
-        direction_lean = "bullish" if raw_avg > 50 else "bearish" if raw_avg < 50 else "neutral"
+    # Accuracy scaling: multiply each dimension's weight by directional accuracy
+    if SCALING_CFG.get("enabled", False):
+        multipliers = SCALING_CFG.get("multipliers", {})
+        min_mult = float(SCALING_CFG.get("min_multiplier", 0.15))
+        direction_lean = "bullish" if raw_avg > 50 else "bearish"
         for role in ALL_ROLES:
-            role_gates = gates.get(role, {})
-            gate_key = f"{direction_lean}_gate"
-            if role_gates.get(gate_key, False):
-                base_weights[role] = 0.0
+            role_mults = multipliers.get(role, {})
+            accuracy = float(role_mults.get(direction_lean, 0.50))
+            accuracy = max(accuracy, min_mult)
+            base_weights[role] *= accuracy
         # Renormalize to sum to 1.0
+        total_w = sum(base_weights.values())
+        if total_w > 0:
+            for role in ALL_ROLES:
+                base_weights[role] = base_weights[role] / total_w
+
+    # Regime-aware weight shifts (after accuracy scaling, before tier multipliers)
+    if regime_shifts:
+        for role in ALL_ROLES:
+            shift = float(regime_shifts.get(role, 1.0))
+            base_weights[role] *= shift
         total_w = sum(base_weights.values())
         if total_w > 0:
             for role in ALL_ROLES:
@@ -763,13 +939,75 @@ def compute_composite(
         if delta_composite is not None:
             composite = ds.blend(composite, delta_composite)
 
-    # Abstain check (Step 4 feature)
+    # Confidence scoring: multi-factor quality gate
+    confidence_score = None
+    confidence_suppressed = False
+    if CONFIDENCE_CFG.get("enabled", False):
+        factors_cfg = CONFIDENCE_CFG.get("factors", {})
+        conf_threshold = float(CONFIDENCE_CFG.get("threshold", 35))
+
+        # Factor 1: Dimension agreement
+        da_weight = float(factors_cfg.get("dimension_agreement", {}).get("weight", 0.35))
+        if composite > 50:
+            agreeing = sum(1 for r in ALL_ROLES if raw_scores[r][0] > 50)
+        else:
+            agreeing = sum(1 for r in ALL_ROLES if raw_scores[r][0] < 50)
+        da_score = (agreeing / len(ALL_ROLES)) * 100
+
+        # Factor 2: Signal strength
+        ss_cfg = factors_cfg.get("signal_strength", {})
+        ss_weight = float(ss_cfg.get("weight", 0.25))
+        max_dist = float(ss_cfg.get("max_distance", 20))
+        ss_score = min(abs(composite - 50) / max_dist, 1.0) * 100
+
+        # Factor 3: Data quality
+        dq_weight = float(factors_cfg.get("data_quality", {}).get("weight", 0.25))
+        full_count = sum(1 for r in ALL_ROLES if data_tiers.get(r) == "full")
+        dq_score = (full_count / len(ALL_ROLES)) * 100
+
+        # Factor 4: Velocity alignment (simplified — use 50 as default)
+        va_weight = float(factors_cfg.get("velocity_alignment", {}).get("weight", 0.15))
+        va_score = 50.0  # No velocity data in backtest; neutral contribution
+
+        confidence_score = round(
+            da_score * da_weight + ss_score * ss_weight +
+            dq_score * dq_weight + va_score * va_weight, 1
+        )
+        if confidence_score < conf_threshold:
+            confidence_suppressed = True
+
+    # Abstain check (Step 4 feature) — with DYNAMIC zones based on F&G
     abstain_applied = False
-    if ABSTAIN_CFG.get("enabled", False):
-        min_distance = float(ABSTAIN_CFG.get("min_distance_from_center", 8))
-        if abs(composite - 50.0) < min_distance:
+    if confidence_suppressed:
+        # Confidence gate overrides: force to neutral
+        abstain_applied = True
+        label_name = "INSUFFICIENT EDGE"
+        direction = "neutral"
+    elif ABSTAIN_CFG.get("enabled", False):
+        base_distance = float(ABSTAIN_CFG.get("min_distance_from_center", 8))
+        resolved_distance = base_distance
+
+        # Dynamic abstain: narrow the band in extreme conditions
+        dynamic_cfg = ABSTAIN_CFG.get("dynamic", {})
+        if dynamic_cfg.get("enabled", False):
+            # Extract F&G from market agent data
+            market_snap = agent_snapshots.get("market")
+            fg_val = None
+            if market_snap:
+                fg_val = market_snap.get("data", {}).get("sentiment", {}).get("fear_greed_index")
+            if fg_val is not None:
+                fg_val = float(fg_val)
+                for zone in dynamic_cfg.get("zones", []):
+                    if zone.get("fg_min", 0) <= fg_val < zone.get("fg_max", 100):
+                        resolved_distance = float(zone.get("threshold", base_distance))
+                        break
+                if fg_val >= 100:
+                    zones = dynamic_cfg.get("zones", [])
+                    if zones:
+                        resolved_distance = float(zones[-1].get("threshold", base_distance))
+
+        if abs(composite - 50.0) < resolved_distance:
             abstain_applied = True
-            # Force to neutral direction
             label_name = ABSTAIN_CFG.get("abstain_label", "INSUFFICIENT EDGE")
             direction = "neutral"
         else:
@@ -999,8 +1237,10 @@ def run_backtest():
     prev_oi_by_asset.clear()  # Reset OI state for clean backtest run
     prev_btc_dom_val.clear()  # Reset BTC dominance state for clean backtest run
     for ts, snapshot in aligned:
+        # Detect regime once per time point (global, based on BTC)
+        _, regime_shifts = detect_regime(snapshot)
         for asset in assets_list:
-            result = compute_composite(asset, snapshot, prev_dims_by_asset.get(asset))
+            result = compute_composite(asset, snapshot, prev_dims_by_asset.get(asset), regime_shifts)
             # Store current dimensions as previous for next iteration
             prev_dims_by_asset[asset] = result.get("dimensions", {})
             all_signals.append({

@@ -76,7 +76,7 @@ class SignalFusion:
         label_cfg = self.profile.get("labels", [])
 
         signals: Dict[str, Dict[str, Any]] = {}
-        all_roles = ["whale", "technical", "derivatives", "narrative", "market"]
+        all_roles = ["whale", "technical", "derivatives", "narrative", "market", "trend"]
 
         # Load delta scorer (YAML-driven change detection)
         delta_scorer = None
@@ -99,11 +99,147 @@ class SignalFusion:
         tier_multipliers = reweight_cfg.get("tier_multipliers", {"full": 1.0, "partial": 0.5, "none": 0.0})
         agent_reweight_rules = reweight_cfg.get("agents", {})
 
+        # --- Phase 6 pre-compute: Dynamic abstain threshold (F&G-driven) ---
+        # Resolve the abstain threshold ONCE before the asset loop.
+        # In extreme fear/greed, contrarian edge is strongest → narrow the band.
+        # In neutral markets, edge is weakest → widen the band.
+        abstain_cfg = self.profile.get("abstain", {})
+        base_min_distance = float(abstain_cfg.get("min_distance_from_center", 8))
+        dynamic_cfg = abstain_cfg.get("dynamic", {})
+        fg_value = None  # Fear & Greed index (0-100)
+
+        if dynamic_cfg.get("enabled", False):
+            # Extract F&G from market agent data
+            market_data = raw.get("market")
+            if market_data:
+                fg_value = market_data.get("data", {}).get("sentiment", {}).get("fear_greed_index")
+
+            if fg_value is not None:
+                # Find matching zone
+                resolved_distance = base_min_distance  # fallback
+                for zone in dynamic_cfg.get("zones", []):
+                    if zone.get("fg_min", 0) <= fg_value < zone.get("fg_max", 100):
+                        resolved_distance = float(zone.get("threshold", base_min_distance))
+                        break
+                # Edge case: F&G = 100 (exactly) → use last zone
+                if fg_value == 100:
+                    zones = dynamic_cfg.get("zones", [])
+                    if zones:
+                        resolved_distance = float(zones[-1].get("threshold", base_min_distance))
+                errors.append(f"dynamic abstain: F&G={fg_value} → threshold={resolved_distance} (base={base_min_distance})")
+            else:
+                resolved_distance = base_min_distance
+                errors.append(f"dynamic abstain: F&G unavailable → using base threshold={base_min_distance}")
+        else:
+            resolved_distance = base_min_distance
+
+        # --- Phase 6 pre-compute: Trend override (BTC 30-day MA check) ---
+        # When BTC is in a confirmed downtrend (price < MA30 AND MA30 falling),
+        # dampen the contrarian inversion on market + derivatives dimensions.
+        # This allows bearish signals to emerge in sustained bear markets.
+        trend_cfg = self.profile.get("trend_override", {})
+        is_downtrend = False
+        trend_dampening = 1.0  # 1.0 = no dampening
+
+        if trend_cfg.get("enabled", False):
+            dampening_factor = float(trend_cfg.get("dampening_factor", 0.5))
+            dampen_dims = trend_cfg.get("dampen_dimensions", ["market", "derivatives"])
+
+            # Get BTC price from market agent
+            btc_price = None
+            market_data = raw.get("market")
+            if market_data:
+                btc_price = market_data.get("data", {}).get("per_asset", {}).get("BTC", {}).get("price")
+
+            # Get BTC MA30 from technical agent
+            btc_ma30 = None
+            tech_data = raw.get("technical")
+            if tech_data:
+                btc_ma30 = tech_data.get("data", {}).get("by_asset", {}).get("BTC", {}).get("ma_30d")
+
+            if btc_price is not None and btc_ma30 is not None and btc_ma30 > 0:
+                pct_below_ma = (btc_price - btc_ma30) / btc_ma30 * 100
+                downtrend_pct = float(trend_cfg.get("downtrend_threshold_pct", -5.0))
+                # Confirmed downtrend: price must be below threshold vs 30-day MA
+                if pct_below_ma < downtrend_pct:
+                    is_downtrend = True
+                    trend_dampening = dampening_factor
+                    errors.append(
+                        f"trend override: BTC ${btc_price:.0f} is {pct_below_ma:.1f}% below MA30 "
+                        f"(${btc_ma30:.0f}) → dampening contrarian on {dampen_dims} by {dampening_factor}"
+                    )
+                else:
+                    errors.append(
+                        f"trend override: BTC ${btc_price:.0f} is {pct_below_ma:+.1f}% vs MA30 "
+                        f"(${btc_ma30:.0f}) → no dampening"
+                    )
+            else:
+                errors.append(f"trend override: BTC price/MA30 unavailable — skipping")
+
+        # --- Phase 4.5 pre-compute: Velocity analyzer ---
+        # Load historical agent data ONCE for velocity computation across all assets.
+        velocity_analyzer = None
+        velocity_cfg = self.profile.get("velocity", {})
+        if velocity_cfg.get("enabled", False):
+            try:
+                from signal_fusion.velocity import VelocityAnalyzer
+                velocity_analyzer = VelocityAnalyzer(self.store, self.profile)
+                vel_errors = velocity_analyzer.preload_history()
+                errors.extend(vel_errors)
+            except Exception as exc:
+                errors.append(f"velocity analyzer init failed: {exc}")
+                velocity_analyzer = None
+
+        # --- Regime detection pre-compute ---
+        # Detect TRENDING vs RANGING using BTC's position relative to MA30.
+        regime_cfg = self.profile.get("regime_weighting", {})
+        detected_regime = "unknown"  # "trending", "ranging", or "unknown"
+        regime_shifts: Dict[str, float] = {}
+
+        if regime_cfg.get("enabled", False):
+            det_cfg = regime_cfg.get("detection", {})
+            trending_t = float(det_cfg.get("trending_threshold", 0.08))
+            ranging_t = float(det_cfg.get("ranging_threshold", 0.03))
+
+            btc_price_r = None
+            btc_ma30_r = None
+            btc_ma7_r = None
+            market_data_r = raw.get("market")
+            tech_data_r = raw.get("technical")
+            if market_data_r:
+                btc_price_r = market_data_r.get("data", {}).get("per_asset", {}).get("BTC", {}).get("price")
+            if tech_data_r:
+                btc_ma30_r = tech_data_r.get("data", {}).get("by_asset", {}).get("BTC", {}).get("ma_30d")
+                btc_ma7_r = tech_data_r.get("data", {}).get("by_asset", {}).get("BTC", {}).get("ma_7d")
+
+            if btc_price_r is not None and btc_ma30_r is not None and btc_ma30_r > 0:
+                pct_from_ma30 = abs((btc_price_r - btc_ma30_r) / btc_ma30_r)
+                ma_aligned = True
+                if det_cfg.get("require_ma_alignment", True) and btc_ma7_r is not None:
+                    price_above = btc_price_r > btc_ma30_r
+                    ma7_above = btc_ma7_r > btc_ma30_r
+                    ma_aligned = (price_above == ma7_above)
+
+                if pct_from_ma30 > trending_t and ma_aligned:
+                    detected_regime = "trending"
+                    regime_shifts = {k: float(v) for k, v in regime_cfg.get("trending", {}).items()}
+                elif pct_from_ma30 < ranging_t:
+                    detected_regime = "ranging"
+                    regime_shifts = {k: float(v) for k, v in regime_cfg.get("ranging", {}).items()}
+
+                errors.append(
+                    f"regime: BTC {pct_from_ma30:.1%} from MA30, aligned={ma_aligned} "
+                    f"→ {detected_regime}"
+                )
+            else:
+                errors.append("regime: BTC data unavailable")
+
         for asset in self.assets:
             # --- Phase 1: Score ALL dimensions first ---
             raw_scores: Dict[str, Tuple[float, str]] = {}
             for role in all_roles:
-                agent_data = raw.get(role)
+                # Trend dimension reads from technical agent (no dedicated trend agent)
+                agent_data = raw.get(role) if role != "trend" else raw.get("technical")
                 rules = scoring_cfg.get(role, {})
                 raw_scores[role] = self._score_dimension(role, asset, agent_data, rules)
 
@@ -141,16 +277,29 @@ class SignalFusion:
             for role in all_roles:
                 base_weights[role] = float(weights.get(role, 0.0))
 
-            # Direction gating: zero out dimensions toxic in specific directions
-            gating_cfg = self.profile.get("direction_gating", {})
-            if gating_cfg.get("enabled", False):
-                gates = gating_cfg.get("gates", {})
-                direction_lean = "bullish" if raw_avg > 50 else "bearish" if raw_avg < 50 else "neutral"
+            # Accuracy scaling: multiply each dimension's weight by its
+            # historical directional accuracy (continuous, replaces binary gating)
+            scaling_cfg = self.profile.get("accuracy_scaling", {})
+            if scaling_cfg.get("enabled", False):
+                multipliers = scaling_cfg.get("multipliers", {})
+                min_mult = float(scaling_cfg.get("min_multiplier", 0.15))
+                direction_lean = "bullish" if raw_avg > 50 else "bearish"
                 for role in all_roles:
-                    role_gates = gates.get(role, {})
-                    gate_key = f"{direction_lean}_gate"
-                    if role_gates.get(gate_key, False):
-                        base_weights[role] = 0.0
+                    role_mults = multipliers.get(role, {})
+                    accuracy = float(role_mults.get(direction_lean, 0.50))
+                    accuracy = max(accuracy, min_mult)
+                    base_weights[role] *= accuracy
+                # Renormalize to sum to 1.0
+                total_w = sum(base_weights.values())
+                if total_w > 0:
+                    for role in all_roles:
+                        base_weights[role] = base_weights[role] / total_w
+
+            # Regime-aware weight shifts: boost directional or contrarian dims
+            if regime_cfg.get("enabled", False) and regime_shifts:
+                for role in all_roles:
+                    shift = float(regime_shifts.get(role, 1.0))
+                    base_weights[role] *= shift
                 # Renormalize to sum to 1.0
                 total_w = sum(base_weights.values())
                 if total_w > 0:
@@ -180,11 +329,25 @@ class SignalFusion:
                         adjusted_weights[role] += total_freed * (base_weights[role] / full_data_sum)
 
             # --- Phase 4: Build dimensions dict and compute composite ---
+            # Apply trend dampening: in confirmed downtrends, pull affected
+            # dimension scores toward 50, reducing the contrarian boost.
+            # This allows bearish signals to emerge in sustained bear markets.
             dimensions: Dict[str, Dict[str, Any]] = {}
             composite = 0.0
+            dampen_dims = trend_cfg.get("dampen_dimensions", []) if trend_cfg.get("enabled", False) else []
 
             for role in all_roles:
                 score, detail = raw_scores[role]
+
+                # Trend dampening: blend score toward 50 for affected dimensions
+                if is_downtrend and role in dampen_dims and score > 50:
+                    # Only dampen scores ABOVE 50 (the contrarian boost part)
+                    # dampening_factor=0.5 means: keep 50% of the distance from 50
+                    # e.g. score=70 → 50 + (70-50)*0.5 = 60
+                    original_score = score
+                    score = 50.0 + (score - 50.0) * trend_dampening
+                    detail = f"{detail}; trend dampened {original_score:.1f}→{score:.1f}"
+
                 label_name, direction = self._classify(score, label_cfg)
                 adj_w = adjusted_weights[role]
 
@@ -198,6 +361,31 @@ class SignalFusion:
                 composite += score * adj_w
 
             composite = round(composite, 1)
+
+            # --- Phase 4.5: Velocity dampening ---
+            # When indicators are accelerating against the signal direction,
+            # dampen the composite toward 50. This prevents premature contrarian
+            # calls (e.g. buying into accelerating fear that keeps dropping).
+            velocity_result = None
+            if velocity_analyzer and velocity_analyzer.is_enabled():
+                try:
+                    velocity_result = velocity_analyzer.compute_asset_velocity(
+                        asset, composite
+                    )
+                    if velocity_result is not None:
+                        vdamp = velocity_result["dampening_factor"]
+                        if vdamp < 1.0:
+                            original_composite = composite
+                            distance = composite - 50.0
+                            composite = round(50.0 + distance * vdamp, 1)
+                            composite = max(0.0, min(100.0, composite))
+                            errors.append(
+                                f"velocity: {asset} dampened "
+                                f"{original_composite:.1f}→{composite:.1f} "
+                                f"(factor={vdamp:.2f})"
+                            )
+                except Exception as exc:
+                    errors.append(f"velocity {asset}: {exc}")
 
             # --- Phase 5: Conviction multiplier ---
             # When 3+ dimensions agree on direction, amplify composite away from 50.
@@ -238,18 +426,93 @@ class SignalFusion:
                 if delta_composite is not None:
                     composite = delta_scorer.blend(composite, delta_composite)
 
+            # --- Phase 5c: Confidence scoring ---
+            # Multi-factor quality gate. If confidence < threshold, suppress signal.
+            confidence_cfg = self.profile.get("confidence", {})
+            confidence_score = None
+            confidence_suppressed = False
+
+            if confidence_cfg.get("enabled", False):
+                factors_cfg = confidence_cfg.get("factors", {})
+                confidence_threshold = float(confidence_cfg.get("threshold", 35))
+
+                # Factor 1: Dimension agreement
+                da_cfg = factors_cfg.get("dimension_agreement", {})
+                da_weight = float(da_cfg.get("weight", 0.35))
+                if composite > 50:
+                    agreeing = sum(1 for r in all_roles if raw_scores[r][0] > 50)
+                else:
+                    agreeing = sum(1 for r in all_roles if raw_scores[r][0] < 50)
+                total_dims = len(all_roles)
+                da_score = ((agreeing - 1) / max(total_dims - 1, 1)) * 100
+
+                # Factor 2: Signal strength (distance from 50)
+                ss_cfg = factors_cfg.get("signal_strength", {})
+                ss_weight = float(ss_cfg.get("weight", 0.25))
+                max_dist = float(ss_cfg.get("max_distance", 20))
+                distance = abs(composite - 50.0)
+                ss_score = min(distance / max_dist, 1.0) * 100
+
+                # Factor 3: Data quality
+                dq_cfg = factors_cfg.get("data_quality", {})
+                dq_weight = float(dq_cfg.get("weight", 0.25))
+                full_count = sum(1 for r in all_roles if data_tiers.get(r) == "full")
+                dq_score = (full_count / max(total_dims, 1)) * 100
+
+                # Factor 4: Velocity alignment
+                va_cfg = factors_cfg.get("velocity_alignment", {})
+                va_weight = float(va_cfg.get("weight", 0.15))
+                aligned_above = float(va_cfg.get("aligned_above", 0.8))
+                opposed_below = float(va_cfg.get("opposed_below", 0.5))
+                if velocity_result and velocity_result.get("dampening_factor") is not None:
+                    vdamp = velocity_result["dampening_factor"]
+                    if vdamp >= aligned_above:
+                        va_score = 100.0
+                    elif vdamp <= opposed_below:
+                        va_score = 0.0
+                    else:
+                        va_score = ((vdamp - opposed_below) / (aligned_above - opposed_below)) * 100
+                else:
+                    va_score = 70.0  # No velocity data = moderate confidence
+
+                confidence_score = round(
+                    da_score * da_weight +
+                    ss_score * ss_weight +
+                    dq_score * dq_weight +
+                    va_score * va_weight,
+                    1
+                )
+
+                if confidence_score < confidence_threshold:
+                    confidence_suppressed = True
+
             # --- Phase 6: Abstain check ---
-            # When composite is too close to 50 (no edge), force neutral.
-            abstain_cfg = self.profile.get("abstain", {})
+            # Use the pre-computed resolved_distance (dynamic F&G-based or fallback).
+            # When dynamic abstain changes the threshold, align MODERATE BUY/SELL
+            # boundaries with the abstain zone edges so there's no dead gap.
             abstain_applied = False
             if abstain_cfg.get("enabled", False):
-                min_distance = float(abstain_cfg.get("min_distance_from_center", 8))
-                if abs(composite - 50.0) < min_distance:
+                # Confidence gate: if confidence is below threshold, force abstain
+                if confidence_suppressed:
+                    abstain_applied = True
+                    label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
+                    direction = "neutral"
+                elif abs(composite - 50.0) < resolved_distance:
                     abstain_applied = True
                     label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
                     direction = "neutral"
                 else:
-                    label_name, direction = self._classify(composite, label_cfg)
+                    # Build dynamic label config: MODERATE BUY at 50+threshold,
+                    # NEUTRAL lower bound at 50-threshold.
+                    dynamic_labels = []
+                    for entry in label_cfg:
+                        e = dict(entry)
+                        if e.get("name") == "MODERATE BUY":
+                            e["min_score"] = 50.0 + resolved_distance
+                        elif e.get("name") == "NEUTRAL":
+                            e["min_score"] = 50.0 - resolved_distance
+                        dynamic_labels.append(e)
+                    label_name, direction = self._classify(composite, dynamic_labels)
             else:
                 label_name, direction = self._classify(composite, label_cfg)
 
@@ -278,14 +541,38 @@ class SignalFusion:
                 "data_tiers": data_tiers,
                 "conviction_boost": conviction_applied,
                 "abstain": abstain_applied,
+                "abstain_threshold": resolved_distance,
+                "trend_dampened": is_downtrend,
+                "regime": detected_regime,
+                "confidence": confidence_score,
+                "confidence_suppressed": confidence_suppressed,
                 "delta": delta_details if delta_details else None,
+                "velocity": velocity_result if velocity_result else None,
             }
 
             # Store current score for next momentum comparison
             self.store.save_kv("fusion_scores", asset, composite)
 
-        # Portfolio summary
+        # Portfolio summary (pass dynamic abstain + trend + velocity info)
         portfolio = self._build_portfolio_summary(signals, raw)
+        portfolio["fear_greed"] = fg_value
+        portfolio["abstain_threshold"] = resolved_distance
+        portfolio["btc_downtrend"] = is_downtrend
+        portfolio["detected_regime"] = detected_regime
+
+        # Velocity summary stats
+        vel_dampened = [
+            s for s in signals.values()
+            if s.get("velocity") and s["velocity"].get("dampening_factor", 1.0) < 1.0
+        ]
+        portfolio["velocity_dampened_count"] = len(vel_dampened)
+        if vel_dampened:
+            avg_damp = sum(
+                s["velocity"]["dampening_factor"] for s in vel_dampened
+            ) / len(vel_dampened)
+            portfolio["avg_velocity_dampening"] = round(avg_damp, 2)
+        else:
+            portfolio["avg_velocity_dampening"] = 1.0
 
         # LLM insights
         llm_cfg = self.profile.get("llm_insights", {})
@@ -460,20 +747,29 @@ class SignalFusion:
         score = 0.0
         details: List[str] = []
 
-        # RSI
+        # RSI — full continuous scoring (no flat buckets in extreme zones)
         rsi_rules = rules.get("rsi", {})
         rsi = asset_data.get("rsi_14")
         if rsi is not None:
             oversold = float(rsi_rules.get("oversold_below", 30))
             overbought = float(rsi_rules.get("overbought_above", 70))
             if rsi < oversold:
-                score += float(rsi_rules.get("oversold_score", 30))
+                # Continuous within oversold zone: RSI 0→oversold maps extreme→oversold score
+                extreme_s = float(rsi_rules.get("extreme_oversold_score", 40))
+                oversold_s = float(rsi_rules.get("oversold_score", 35))
+                ratio = rsi / oversold if oversold > 0 else 0.0  # 0.0 at RSI=0, 1.0 at threshold
+                score += extreme_s + ratio * (oversold_s - extreme_s)
                 details.append(f"RSI {rsi:.0f} oversold")
             elif rsi > overbought:
-                score += float(rsi_rules.get("overbought_score", 10))
+                # Continuous within overbought zone: RSI overbought→100 maps overbought→extreme score
+                overbought_s = float(rsi_rules.get("overbought_score", 10))
+                extreme_s = float(rsi_rules.get("extreme_overbought_score", 5))
+                denom = 100.0 - overbought
+                ratio = (rsi - overbought) / denom if denom > 0 else 0.0
+                score += overbought_s + ratio * (extreme_s - overbought_s)
                 details.append(f"RSI {rsi:.0f} overbought")
             else:
-                # Linear interpolation between oversold and overbought
+                # Linear interpolation between oversold and overbought (unchanged)
                 ratio = (rsi - oversold) / (overbought - oversold)
                 min_s = float(rsi_rules.get("neutral_min_score", 15))
                 max_s = float(rsi_rules.get("neutral_max_score", 40))
@@ -551,7 +847,12 @@ class SignalFusion:
             contrarian = float(ls_rules.get("contrarian_below", 0.45))
 
             if ls_ratio > very_overcrowded:
-                score += float(ls_rules.get("very_overcrowded_score", 3))
+                # Continuous: more overcrowded = lower score
+                very_oc_s = float(ls_rules.get("very_overcrowded_score", 3))
+                oc_s = float(ls_rules.get("overcrowded_score", 8))
+                denom = 1.0 - very_overcrowded
+                ratio = min((ls_ratio - very_overcrowded) / denom, 1.0) if denom > 0 else 1.0
+                score += oc_s + ratio * (very_oc_s - oc_s)
                 details.append(f"L/S {ls_ratio:.2f} very overcrowded")
                 ls_tier = "very_overcrowded"
             elif sweet_min <= ls_ratio <= sweet_max:
@@ -559,11 +860,20 @@ class SignalFusion:
                 details.append(f"L/S {ls_ratio:.2f} sweet spot")
                 ls_tier = "sweet_spot"
             elif ls_ratio > overcrowded:
-                score += float(ls_rules.get("overcrowded_score", 10))
+                # Continuous between sweet_max and very_overcrowded
+                oc_s = float(ls_rules.get("overcrowded_score", 8))
+                sw_s = float(ls_rules.get("sweet_spot_score", 18))
+                denom = very_overcrowded - sweet_max
+                ratio = (ls_ratio - sweet_max) / denom if denom > 0 else 0.0
+                score += sw_s + ratio * (oc_s - sw_s)
                 details.append(f"L/S {ls_ratio:.2f} overcrowded")
                 ls_tier = "overcrowded"
             elif ls_ratio < contrarian:
-                score += float(ls_rules.get("contrarian_score", 35))
+                # Continuous: lower ratio = stronger contrarian signal
+                contrarian_s = float(ls_rules.get("contrarian_score", 35))
+                extreme_contrarian_s = float(ls_rules.get("extreme_contrarian_score", 40))
+                ratio = ls_ratio / contrarian if contrarian > 0 else 0.0  # 0.0 at ratio=0, 1.0 at threshold
+                score += extreme_contrarian_s + ratio * (contrarian_s - extreme_contrarian_s)
                 details.append(f"L/S {ls_ratio:.2f} contrarian")
                 ls_tier = "contrarian"
             else:
@@ -571,13 +881,18 @@ class SignalFusion:
                 details.append(f"L/S {ls_ratio:.2f}")
                 ls_tier = "default"
 
-        # Funding rate
+        # Funding rate — continuous within negative and positive zones
         fund_rules = rules.get("funding", {})
         funding = asset_data.get("funding_rate")
         funding_tier = None  # Track for combo scoring
         if funding is not None:
             if funding < 0:
-                score += float(fund_rules.get("negative_score", 35))
+                # Continuous: more negative = stronger squeeze signal
+                extreme_neg_threshold = float(fund_rules.get("extreme_negative_threshold", 0.005))
+                extreme_neg_score = float(fund_rules.get("extreme_negative_score", 40))
+                mild_neg_score = float(fund_rules.get("negative_mild_score", 25))
+                intensity = min(abs(funding) / extreme_neg_threshold, 1.0) if extreme_neg_threshold > 0 else 0.0
+                score += mild_neg_score + intensity * (extreme_neg_score - mild_neg_score)
                 details.append(f"funding {funding:.5f} negative")
                 funding_tier = "negative"
             elif funding < float(fund_rules.get("low_threshold", 0.0002)):
@@ -585,10 +900,24 @@ class SignalFusion:
                 details.append("low funding")
                 funding_tier = "low"
             elif funding < float(fund_rules.get("moderate_threshold", 0.0005)):
-                score += float(fund_rules.get("moderate_score", 15))
+                # Continuous between low and moderate
+                low_t = float(fund_rules.get("low_threshold", 0.0002))
+                mod_t = float(fund_rules.get("moderate_threshold", 0.0005))
+                low_s = float(fund_rules.get("low_score", 17))
+                mod_s = float(fund_rules.get("moderate_score", 12))
+                denom = mod_t - low_t
+                ratio = (funding - low_t) / denom if denom > 0 else 0.0
+                score += low_s + ratio * (mod_s - low_s)
                 funding_tier = "moderate"
             else:
-                score += float(fund_rules.get("high_score", 5))
+                # Continuous above moderate: higher funding = worse
+                mod_t = float(fund_rules.get("moderate_threshold", 0.0005))
+                high_s = float(fund_rules.get("high_score", 5))
+                mod_s = float(fund_rules.get("moderate_score", 12))
+                extreme_high_threshold = float(fund_rules.get("extreme_high_threshold", 0.003))
+                denom = extreme_high_threshold - mod_t
+                ratio = min((funding - mod_t) / denom, 1.0) if denom > 0 else 1.0
+                score += mod_s + ratio * (high_s - mod_s)
                 details.append("high funding")
                 funding_tier = "high"
 
@@ -744,9 +1073,9 @@ class SignalFusion:
         per_asset = data.get("per_asset", {})
         asset_data = per_asset.get(asset, {})
         details: List[str] = []
-        score = 0.0
+        score = float(rules.get("base_score", 0.0))  # Bipolar: start at 50
 
-        # Price change
+        # Price change — continuous scoring (no flat buckets)
         pc_rules = rules.get("price_change", {})
         change_24h = asset_data.get("change_24h_pct")
         if change_24h is not None:
@@ -755,16 +1084,38 @@ class SignalFusion:
             mild_neg = float(pc_rules.get("mild_negative_above", -5.0))
 
             if change_24h > strong_pos:
-                score += float(pc_rules.get("strong_positive_score", 40))
+                # Continuous: bigger rally = lower contrarian score
+                strong_pos_s = float(pc_rules.get("strong_positive_score", 10))
+                extreme_rally_s = float(pc_rules.get("extreme_rally_score", 5))
+                extreme_rally_above = float(pc_rules.get("extreme_rally_above", 20.0))
+                denom = extreme_rally_above - strong_pos
+                ratio = min((change_24h - strong_pos) / denom, 1.0) if denom > 0 else 0.0
+                score += strong_pos_s + ratio * (extreme_rally_s - strong_pos_s)
                 details.append(f"+{change_24h:.1f}% strong")
             elif change_24h > pos:
-                score += float(pc_rules.get("positive_score", 30))
+                # Continuous between 0% and +5%
+                pos_s = float(pc_rules.get("positive_score", 15))
+                strong_pos_s = float(pc_rules.get("strong_positive_score", 10))
+                denom = strong_pos - pos
+                ratio = (change_24h - pos) / denom if denom > 0 else 0.0
+                score += pos_s + ratio * (strong_pos_s - pos_s)
                 details.append(f"+{change_24h:.1f}%")
             elif change_24h > mild_neg:
-                score += float(pc_rules.get("mild_negative_score", 20))
+                # Continuous between -5% and 0%
+                mild_neg_s = float(pc_rules.get("mild_negative_score", 25))
+                pos_s = float(pc_rules.get("positive_score", 15))
+                denom = pos - mild_neg
+                ratio = (change_24h - mild_neg) / denom if denom > 0 else 0.0
+                score += mild_neg_s + ratio * (pos_s - mild_neg_s)
                 details.append(f"{change_24h:.1f}%")
             else:
-                score += float(pc_rules.get("strong_negative_score", 10))
+                # Continuous: bigger drop = higher contrarian score
+                strong_neg_s = float(pc_rules.get("strong_negative_score", 30))
+                extreme_drop_s = float(pc_rules.get("extreme_drop_score", 35))
+                extreme_drop_below = float(pc_rules.get("extreme_drop_below", -20.0))
+                denom = mild_neg - extreme_drop_below
+                ratio = min((mild_neg - change_24h) / denom, 1.0) if denom > 0 else 0.0
+                score += strong_neg_s + ratio * (extreme_drop_s - strong_neg_s)
                 details.append(f"{change_24h:.1f}% drop")
 
         # Volume spike — market agent stores this in per_asset directly
@@ -784,24 +1135,51 @@ class SignalFusion:
             else:
                 score += float(vol_rules.get("normal_score", 10))
 
-        # Fear & Greed (global, same for all assets)
+        # Fear & Greed (global, same for all assets) — continuous scoring
         fg_rules = rules.get("fear_greed", {})
         sentiment = data.get("sentiment", {})
         fg_value = sentiment.get("fear_greed_index")
         if fg_value is not None:
             fg = float(fg_value)
-            if fg < float(fg_rules.get("extreme_fear_below", 25)):
-                score += float(fg_rules.get("extreme_fear_score", 30))
+            ef_below = float(fg_rules.get("extreme_fear_below", 25))
+            f_below = float(fg_rules.get("fear_below", 45))
+            n_below = float(fg_rules.get("neutral_below", 55))
+            g_below = float(fg_rules.get("greed_below", 75))
+
+            ef_score = float(fg_rules.get("extreme_fear_score", 25))
+            max_ef_score = float(fg_rules.get("max_extreme_fear_score", 30))
+            f_score = float(fg_rules.get("fear_score", 20))
+            n_score = float(fg_rules.get("neutral_score", 15))
+            g_score = float(fg_rules.get("greed_score", 10))
+            eg_score = float(fg_rules.get("extreme_greed_score", 5))
+            min_eg_score = float(fg_rules.get("min_extreme_greed_score", 3))
+
+            if fg < ef_below:
+                # Continuous: F&G 0→25 maps to max_extreme→extreme score
+                ratio = fg / ef_below if ef_below > 0 else 0.0
+                score += max_ef_score + ratio * (ef_score - max_ef_score)
                 details.append(f"F&G {fg:.0f} extreme fear")
-            elif fg < float(fg_rules.get("fear_below", 45)):
-                score += float(fg_rules.get("fear_score", 25))
+            elif fg < f_below:
+                # Continuous: F&G 25→45 maps to extreme_fear→fear score
+                denom = f_below - ef_below
+                ratio = (fg - ef_below) / denom if denom > 0 else 0.0
+                score += ef_score + ratio * (f_score - ef_score)
                 details.append(f"F&G {fg:.0f} fear")
-            elif fg < float(fg_rules.get("neutral_below", 55)):
-                score += float(fg_rules.get("neutral_score", 15))
-            elif fg < float(fg_rules.get("greed_below", 75)):
-                score += float(fg_rules.get("greed_score", 10))
+            elif fg < n_below:
+                # Continuous: F&G 45→55 maps to fear→neutral score
+                denom = n_below - f_below
+                ratio = (fg - f_below) / denom if denom > 0 else 0.0
+                score += f_score + ratio * (n_score - f_score)
+            elif fg < g_below:
+                # Continuous: F&G 55→75 maps to neutral→greed score
+                denom = g_below - n_below
+                ratio = (fg - n_below) / denom if denom > 0 else 0.0
+                score += n_score + ratio * (g_score - n_score)
             else:
-                score += float(fg_rules.get("extreme_greed_score", 5))
+                # Continuous: F&G 75→100 maps to greed→min extreme greed score
+                denom = 100.0 - g_below
+                ratio = min((fg - g_below) / denom, 1.0) if denom > 0 else 1.0
+                score += g_score + ratio * (min_eg_score - g_score)
                 details.append(f"F&G {fg:.0f} extreme greed")
 
         # BTC Dominance (global, scored differently for BTC vs alts)
@@ -837,11 +1215,146 @@ class SignalFusion:
                     key = "btc_stable_score" if is_btc else "alt_stable_score"
                     score += float(btcd_rules.get(key, 10))
 
+        # Trend awareness penalty: when fear AND price drop confirm each other,
+        # this is likely a genuine downtrend — not a dip-buying opportunity.
+        # Contrarian signals work when they CONTRADICT (fear + stable price).
+        # When they ALIGN (fear + dropping price), dampen the bullish push.
+        ta_rules = rules.get("trend_awareness", {})
+        if ta_rules.get("enabled", False):
+            fg_t = float(ta_rules.get("fg_threshold", 35))
+            drop_t = float(ta_rules.get("drop_threshold", -2.0))
+            max_pen = float(ta_rules.get("max_penalty", -30))
+
+            # Get the F&G and price change we already computed
+            sentiment = data.get("sentiment", {})
+            fg_val = sentiment.get("fear_greed_index")
+            chg = asset_data.get("change_24h_pct")
+
+            if fg_val is not None and chg is not None:
+                fg_f = float(fg_val)
+                chg_f = float(chg)
+                if fg_f < fg_t and chg_f < drop_t:
+                    fg_intensity = (fg_t - fg_f) / fg_t  # 0→1 as fear increases
+                    drop_intensity = min(abs(chg_f) / 10.0, 1.0)  # 0→1 as drop deepens
+                    penalty = fg_intensity * drop_intensity * max_pen
+                    score += penalty
+                    details.append(f"downtrend penalty {penalty:.0f}")
+
         return min(100.0, max(0.0, score)), "; ".join(details) if details else "no market data"
 
     # ================================================================ #
-    #  Data-tier detection (universal reweighting)
+    #  TREND (pro-momentum) scorer
     # ================================================================ #
+
+    def _score_trend(self, asset: str, data: Dict[str, Any], rules: Dict[str, Any]) -> Tuple[float, str]:
+        """
+        Pro-trend scorer — follows the trend instead of fighting it.
+
+        Unlike the contrarian technical/market scorers, this dimension says:
+        - Downtrend + bearish indicators → bearish score (< 50)
+        - Uptrend + bullish indicators → bullish score (> 50)
+
+        Reads from BOTH technical and market agent data (stored in raw).
+        The 'data' parameter here comes from technical agent via _score_dimension,
+        but we also read market data from the store separately.
+        """
+        details: List[str] = []
+        score = 50.0  # Start neutral
+
+        by_asset = data.get("by_asset", {})
+        asset_data = by_asset.get(asset, {})
+
+        # Also load market agent data for 24h price change
+        market_latest = self.store.load_latest(
+            self.profile.get("agent_names", {}).get("market", "market_agent")
+        )
+        market_asset_data = {}
+        if market_latest:
+            market_asset_data = market_latest.get("data", {}).get("per_asset", {}).get(asset, {})
+
+        # --- Component 1: MA Alignment (±15 pts) ---
+        ma_rules = rules.get("ma_alignment", {})
+        price = asset_data.get("price")
+        ma_7d = asset_data.get("ma_7d")
+        ma_30d = asset_data.get("ma_30d")
+
+        if price is not None and ma_7d is not None and ma_30d is not None:
+            if price > ma_7d and ma_7d > ma_30d:
+                score += float(ma_rules.get("bullish_chain_score", 15))
+                details.append("MA bullish chain")
+            elif price < ma_7d and ma_7d < ma_30d:
+                score += float(ma_rules.get("bearish_chain_score", -15))
+                details.append("MA bearish chain")
+            elif price > ma_30d:
+                score += float(ma_rules.get("partial_bullish_score", 8))
+                details.append("above MA30")
+            elif price < ma_30d:
+                score += float(ma_rules.get("partial_bearish_score", -8))
+                details.append("below MA30")
+
+        # --- Component 2: RSI Momentum (±12 pts) — PRO-TREND (not contrarian!) ---
+        rsi_rules = rules.get("rsi_momentum", {})
+        rsi = asset_data.get("rsi_14")
+        if rsi is not None:
+            strong_bullish = float(rsi_rules.get("strong_bullish_above", 65))
+            bullish = float(rsi_rules.get("bullish_above", 55))
+            bearish = float(rsi_rules.get("bearish_below", 45))
+            strong_bearish = float(rsi_rules.get("strong_bearish_below", 35))
+
+            if rsi > strong_bullish:
+                score += float(rsi_rules.get("strong_bullish_score", 12))
+                details.append(f"RSI {rsi:.0f} strong momentum")
+            elif rsi > bullish:
+                score += float(rsi_rules.get("bullish_score", 6))
+                details.append(f"RSI {rsi:.0f} momentum")
+            elif rsi < strong_bearish:
+                score += float(rsi_rules.get("strong_bearish_score", -12))
+                details.append(f"RSI {rsi:.0f} strong downward")
+            elif rsi < bearish:
+                score += float(rsi_rules.get("bearish_score", -6))
+                details.append(f"RSI {rsi:.0f} downward")
+
+        # --- Component 3: Price Change Direction (±10 pts) — PRO-TREND ---
+        pc_rules = rules.get("price_change", {})
+        change_24h = market_asset_data.get("change_24h_pct")
+        if change_24h is not None:
+            strong_pos = float(pc_rules.get("strong_positive_above", 5.0))
+            mild_pos = float(pc_rules.get("positive_above", 1.0))
+            mild_neg = float(pc_rules.get("negative_below", -1.0))
+            strong_neg = float(pc_rules.get("strong_negative_below", -5.0))
+
+            if change_24h > strong_pos:
+                score += float(pc_rules.get("strong_positive_score", 10))
+                details.append(f"+{change_24h:.1f}% strong up")
+            elif change_24h > mild_pos:
+                score += float(pc_rules.get("positive_score", 5))
+                details.append(f"+{change_24h:.1f}%")
+            elif change_24h < strong_neg:
+                score += float(pc_rules.get("strong_negative_score", -10))
+                details.append(f"{change_24h:.1f}% strong down")
+            elif change_24h < mild_neg:
+                score += float(pc_rules.get("negative_score", -5))
+                details.append(f"{change_24h:.1f}%")
+
+        # --- Component 4: Trend Strength (±8 pts) — distance from MA30 ---
+        strength_rules = rules.get("trend_strength", {})
+        if price is not None and ma_30d is not None and ma_30d > 0:
+            pct_from_ma = ((price - ma_30d) / ma_30d) * 100
+            strong_above = float(strength_rules.get("strong_above_pct", 10))
+            strong_below = float(strength_rules.get("strong_below_pct", -10))
+            max_bonus = float(strength_rules.get("max_bonus", 8))
+            max_penalty = float(strength_rules.get("max_penalty", -8))
+
+            if pct_from_ma > 0:
+                intensity = min(pct_from_ma / strong_above, 1.0)
+                score += intensity * max_bonus
+            else:
+                intensity = min(abs(pct_from_ma) / abs(strong_below), 1.0)
+                score += intensity * max_penalty
+
+        # Clamp to 0-100
+        score = max(0.0, min(100.0, score))
+        return score, "; ".join(details) if details else "no trend data"
 
     def _detect_data_tier(
         self, role: str, score: float, detail: str, rules: Dict[str, Any],
