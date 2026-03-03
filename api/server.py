@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from shared.storage import Storage
@@ -155,16 +155,24 @@ if _X402_ENABLED:
                 "Portfolio summary + LLM insights."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {"discoverable": True}},
+            extensions={"bazaar": {
+                "discoverable": True,
+                "info": {"input": {"method": "GET"}},
+                "schema": {"properties": {"input": {"required": ["method"]}}},
+            }},
         ),
         "GET /signal/*": X402RouteConfig(
             accepts=[_payment_option],
             description=(
-                "Single asset crypto signal: 5-dimension composite score (0-100), "
+                "Single asset crypto signal: 6-dimension composite score (0-100), "
                 "direction, momentum, and market context."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {"discoverable": True}},
+            extensions={"bazaar": {
+                "discoverable": True,
+                "info": {"input": {"method": "GET", "path_params": {"asset": "BTC"}}},
+                "schema": {"properties": {"input": {"required": ["method"]}}},
+            }},
         ),
         "GET /performance/reputation": X402RouteConfig(
             accepts=[_payment_option],
@@ -173,7 +181,11 @@ if _X402_ENABLED:
                 "per-asset breakdown. Verifiable reputation score."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {"discoverable": True}},
+            extensions={"bazaar": {
+                "discoverable": True,
+                "info": {"input": {"method": "GET"}},
+                "schema": {"properties": {"input": {"required": ["method"]}}},
+            }},
         ),
     }
     print(f"x402: configured {len(_x402_routes)} paid routes (pay_to={_PAY_TO[:10]}...)")
@@ -611,18 +623,25 @@ async def root():
         "name": "Web3 Signals API",
         "version": "0.2.0",
         "description": "AI-powered crypto signal intelligence for 20 assets",
+        "model_version": "v0.2.0-regime-aware",
         "endpoints": {
             "/dashboard": "Live signal intelligence dashboard (open in browser)",
             "/health": "Agent status and uptime",
             "/signal": "Full fusion — portfolio + 20 signals + LLM insights",
             "/signal/{asset}": "Single asset signal (e.g. /signal/BTC)",
             "/performance/reputation": "Public reputation score — 30-day signal accuracy",
+            "/performance": "Overall accuracy overview (free)",
             "/performance/{asset}": "Per-asset accuracy breakdown",
             "/analytics": "API usage analytics — who's using us, request trends",
             "/api/history": "Paginated history of all agent runs",
+        },
+        "discovery": {
             "/.well-known/agent.json": "A2A agent discovery card (Google A2A protocol)",
             "/.well-known/agents.md": "AGENTS.md — Agentic AI Foundation discovery",
-            "/docs": "OpenAPI documentation",
+            "/.well-known/x402.json": "x402 payment protocol discovery",
+            "/openapi.json": "OpenAPI 3.0 specification",
+            "/docs": "Swagger UI — interactive API documentation",
+            "/robots.txt": "Crawler guidance",
         },
         "assets": [
             "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT",
@@ -974,7 +993,7 @@ async def reset_accuracy(request: Request):
 async def agent_card():
     """Agent-to-Agent discovery card (Google A2A protocol)."""
     base_url = os.getenv("BASE_URL", "http://localhost:8000")
-    return {
+    card: Dict[str, Any] = {
         "name": "Web3 Signals Agent",
         "description": (
             "AI-powered crypto signal intelligence. Fuses whale tracking, "
@@ -984,23 +1003,43 @@ async def agent_card():
         ),
         "url": base_url,
         "version": "0.2.0",
+        "model_version": "v0.2.0-regime-aware",
         "capabilities": [
             {
                 "name": "get_all_signals",
                 "description": "Get scored signals for all 20 crypto assets with portfolio summary and LLM insights",
                 "endpoint": f"{base_url}/signal",
                 "method": "GET",
+                "response_fields": [
+                    "composite_score", "direction", "label", "dimensions",
+                    "regime", "momentum", "confidence", "data_tiers", "velocity",
+                ],
             },
             {
                 "name": "get_asset_signal",
                 "description": "Get signal for a specific crypto asset (e.g. BTC, ETH, SOL)",
                 "endpoint": f"{base_url}/signal/{{asset}}",
                 "method": "GET",
+                "parameters": {"asset": {"type": "string", "enum": [
+                    "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT",
+                    "MATIC", "LINK", "UNI", "ATOM", "LTC", "FIL", "NEAR",
+                    "APT", "ARB", "OP", "INJ", "SUI",
+                ]}},
             },
             {
                 "name": "get_reputation",
-                "description": "Get public reputation score — rolling 30-day signal accuracy across 24h/48h timeframes, per-asset breakdown",
+                "description": "Rolling 30-day signal accuracy — gradient + binary at 24h/48h windows, per-asset breakdown, full methodology",
                 "endpoint": f"{base_url}/performance/reputation",
+                "method": "GET",
+                "response_fields": [
+                    "reputation_score", "accuracy_30d", "by_timeframe",
+                    "by_asset", "methodology", "abstention_rate",
+                ],
+            },
+            {
+                "name": "get_performance_free",
+                "description": "Overall accuracy overview — free tier, no payment required",
+                "endpoint": f"{base_url}/performance",
                 "method": "GET",
             },
             {
@@ -1016,12 +1055,22 @@ async def agent_card():
                 "method": "GET",
             },
         ],
+        "scoring_model": {
+            "type": "multi_agent_fusion",
+            "dimensions": ["whale", "technical", "derivatives", "narrative", "market", "trend"],
+            "score_range": [0, 100],
+            "center": 50,
+            "abstain_zone": [38, 62],
+            "confidence_model": "gradient_volatility_normalized",
+            "regime_detection": "btc_ma30_distance",
+            "accuracy_scaling": "per_dimension_per_direction",
+        },
         "protocols": {
             "rest": f"{base_url}/docs",
+            "openapi": f"{base_url}/openapi.json",
             "mcp_sse": f"{base_url}/mcp/sse",
             "a2a": f"{base_url}/.well-known/agent.json",
             "agents_md": f"{base_url}/.well-known/agents.md",
-            **({"x402": f"{base_url}/signal"} if _X402_ENABLED else {}),
         },
         "assets_covered": [
             "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT",
@@ -1029,8 +1078,26 @@ async def agent_card():
             "ARB", "OP", "INJ", "SUI",
         ],
         "update_frequency": "Every 15 minutes",
-        "pricing": "$0.001/call USDC on Base via x402" if _X402_ENABLED else "Free",
+        "response_format": "application/json",
+        "schema_stable": True,
     }
+    if _X402_ENABLED:
+        card["protocols"]["x402"] = f"{base_url}/signal"
+        card["protocols"]["x402_discovery"] = f"{base_url}/.well-known/x402.json"
+        card["settlement"] = {
+            "protocol": "x402",
+            "network": "Base (eip155:8453)",
+            "token": "USDC",
+            "price_per_call": "$0.001",
+            "facilitator": _X402_FACILITATOR_URL,
+        }
+        card["pricing"] = {
+            "paid": {"/signal": "$0.001", "/signal/{asset}": "$0.001", "/performance/reputation": "$0.001"},
+            "free": ["/health", "/performance", "/performance/{asset}", "/analytics", "/dashboard", "/docs", "/.well-known/*"],
+        }
+    else:
+        card["pricing"] = "Free"
+    return card
 
 
 # ---------------------------------------------------------------------------
@@ -1044,6 +1111,68 @@ async def agents_md():
     agents_path = pathlib.Path(__file__).resolve().parent.parent / "AGENTS.md"
     content = agents_path.read_text() if agents_path.exists() else "# Web3 Signals Agent"
     return PlainTextResponse(content, media_type="text/markdown")
+
+
+# ---------------------------------------------------------------------------
+# /.well-known/x402.json — x402 payment protocol discovery
+# ---------------------------------------------------------------------------
+@app.get("/.well-known/x402.json", tags=["discovery"], include_in_schema=False)
+async def x402_discovery():
+    """x402 payment protocol discovery — machine-readable payment config."""
+    base_url = os.getenv("BASE_URL", "http://localhost:8000")
+    if not _X402_ENABLED:
+        return {"x402_enabled": False}
+    return {
+        "x402_version": 2,
+        "provider": "Web3 Signals Agent",
+        "network": "eip155:8453",
+        "token": "USDC",
+        "token_address": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        "facilitator": _X402_FACILITATOR_URL,
+        "pay_to": _PAY_TO,
+        "routes": {
+            "/signal": {"method": "GET", "price": "$0.001", "description": "Full 20-asset signal fusion with LLM insights"},
+            "/signal/{asset}": {"method": "GET", "price": "$0.001", "description": "Single asset signal (6 dimensions)"},
+            "/performance/reputation": {"method": "GET", "price": "$0.001", "description": "30-day rolling accuracy score"},
+        },
+        "free_routes": ["/health", "/performance", "/analytics", "/dashboard", "/docs", "/.well-known/*"],
+        "discovery": {
+            "agent_card": f"{base_url}/.well-known/agent.json",
+            "agents_md": f"{base_url}/.well-known/agents.md",
+            "openapi": f"{base_url}/openapi.json",
+            "mcp": f"{base_url}/mcp/sse",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
+# /robots.txt — Guide AI crawlers and search engines
+# ---------------------------------------------------------------------------
+@app.get("/robots.txt", include_in_schema=False)
+async def robots_txt():
+    """robots.txt — Guide crawlers to machine-readable endpoints."""
+    content = """User-agent: *
+Allow: /
+Allow: /docs
+Allow: /openapi.json
+Allow: /.well-known/
+Allow: /health
+Allow: /performance
+Allow: /analytics
+Disallow: /api/
+Disallow: /admin/
+Disallow: /mcp/messages
+
+# AI Agent Discovery
+# Agent Card: /.well-known/agent.json
+# AGENTS.md: /.well-known/agents.md
+# x402 Payments: /.well-known/x402.json
+# OpenAPI Spec: /openapi.json
+# MCP Transport: /mcp/sse
+
+Sitemap: none
+"""
+    return PlainTextResponse(content.strip(), media_type="text/plain")
 
 
 # ---------------------------------------------------------------------------

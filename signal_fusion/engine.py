@@ -610,6 +610,7 @@ class SignalFusion:
         result = {
             "agent": "signal_fusion",
             "profile": self.profile.get("name", "signal_fusion_default"),
+            "model_version": "v0.2.0-regime-aware",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "success" if not errors else "partial",
             "data": {
