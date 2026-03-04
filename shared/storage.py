@@ -802,8 +802,14 @@ class Storage:
 
     def save_api_request(self, endpoint: str, method: str, user_agent: str,
                           status_code: int, duration_ms: float,
-                          client_ip: str = "") -> None:
-        """Log an API request for analytics."""
+                          client_ip: str = "",
+                          payment_status: str | None = None) -> None:
+        """Log an API request for analytics.
+
+        payment_status: None (not a paid route), 'payment_required' (402),
+                        'paid' (200 with payment header), 'payment_failed',
+                        'free' (paid route served free — gate disabled).
+        """
         table = "api_requests"
         now = datetime.now(timezone.utc).isoformat()
 
@@ -819,7 +825,8 @@ class Storage:
                         f"  user_agent TEXT,"
                         f"  status_code INTEGER NOT NULL,"
                         f"  duration_ms DOUBLE PRECISION,"
-                        f"  client_ip TEXT"
+                        f"  client_ip TEXT,"
+                        f"  payment_status TEXT"
                         f")"
                     )
                     cur.execute(
@@ -828,11 +835,19 @@ class Storage:
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS idx_{table}_ep ON {table} (endpoint)"
                     )
+                    # Add payment_status column if table exists without it
+                    try:
+                        cur.execute(
+                            f"ALTER TABLE {table} ADD COLUMN payment_status TEXT"
+                        )
+                    except Exception:
+                        pass  # Column already exists
                     cur.execute(
                         f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
-                        f"status_code, duration_ms, client_ip) "
-                        f"VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (now, endpoint, method, user_agent, status_code, duration_ms, client_ip),
+                        f"status_code, duration_ms, client_ip, payment_status) "
+                        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        (now, endpoint, method, user_agent, status_code, duration_ms,
+                         client_ip, payment_status),
                     )
                 conn.commit()
         else:
@@ -846,7 +861,8 @@ class Storage:
                     f"  user_agent TEXT,"
                     f"  status_code INTEGER NOT NULL,"
                     f"  duration_ms REAL,"
-                    f"  client_ip TEXT"
+                    f"  client_ip TEXT,"
+                    f"  payment_status TEXT"
                     f")"
                 )
                 conn.execute(
@@ -855,11 +871,19 @@ class Storage:
                 conn.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{table}_ep ON {table} (endpoint)"
                 )
+                # Add payment_status column if table exists without it
+                try:
+                    conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN payment_status TEXT"
+                    )
+                except Exception:
+                    pass  # Column already exists
                 conn.execute(
                     f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
-                    f"status_code, duration_ms, client_ip) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (now, endpoint, method, user_agent, status_code, duration_ms, client_ip),
+                    f"status_code, duration_ms, client_ip, payment_status) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now, endpoint, method, user_agent, status_code, duration_ms,
+                     client_ip, payment_status),
                 )
                 conn.commit()
 
@@ -999,6 +1023,166 @@ class Storage:
                         (since,),
                     ).fetchone()
                     result["avg_duration_ms"] = round(float(row[0]), 1) if row and row[0] else 0
+            except Exception:
+                pass
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  x402 payment analytics
+    # ------------------------------------------------------------------ #
+
+    def load_x402_analytics(self, days: int = 30) -> Dict[str, Any]:
+        """Load x402 payment-specific analytics."""
+        table = "api_requests"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        result: Dict[str, Any] = {
+            "total_paid_calls": 0,
+            "total_402_challenges": 0,
+            "total_payment_failures": 0,
+            "estimated_revenue_usdc": 0.0,
+            "by_endpoint": {},
+            "by_client_type": {},
+            "paid_per_day": {},
+            "avg_paid_latency_ms": 0,
+        }
+
+        def _process_rows(rows_paid, rows_402, rows_fail, rows_ep, rows_client,
+                          rows_daily, avg_lat):
+            result["total_paid_calls"] = rows_paid or 0
+            result["total_402_challenges"] = rows_402 or 0
+            result["total_payment_failures"] = rows_fail or 0
+            result["estimated_revenue_usdc"] = round(
+                (rows_paid or 0) * 0.001, 4
+            )
+            if rows_ep:
+                for row in rows_ep:
+                    result["by_endpoint"][row[0]] = row[1]
+            if rows_client:
+                for row in rows_client:
+                    ua = row[0] or "unknown"
+                    ua_type = _classify_user_agent(ua)
+                    result["by_client_type"][ua_type] = (
+                        result["by_client_type"].get(ua_type, 0) + row[1]
+                    )
+            if rows_daily:
+                for row in rows_daily:
+                    result["paid_per_day"][row[0]] = row[1]
+            result["avg_paid_latency_ms"] = round(float(avg_lat), 1) if avg_lat else 0
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid'",
+                            (since,),
+                        )
+                        paid = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'payment_required'",
+                            (since,),
+                        )
+                        challenges = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'payment_failed'",
+                            (since,),
+                        )
+                        fails = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT endpoint, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid' "
+                            f"GROUP BY endpoint ORDER BY COUNT(*) DESC",
+                            (since,),
+                        )
+                        ep_rows = cur.fetchall()
+
+                        cur.execute(
+                            f"SELECT user_agent, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid' "
+                            f"GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 20",
+                            (since,),
+                        )
+                        client_rows = cur.fetchall()
+
+                        cur.execute(
+                            f"SELECT LEFT(timestamp, 10), COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid' "
+                            f"GROUP BY LEFT(timestamp, 10) ORDER BY 1",
+                            (since,),
+                        )
+                        daily_rows = cur.fetchall()
+
+                        cur.execute(
+                            f"SELECT AVG(duration_ms) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid' "
+                            f"AND duration_ms > 0",
+                            (since,),
+                        )
+                        avg = (cur.fetchone() or [0])[0]
+
+                        _process_rows(paid, challenges, fails, ep_rows,
+                                      client_rows, daily_rows, avg)
+            except Exception:
+                pass
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    paid = (conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid'",
+                        (since,),
+                    ).fetchone() or [0])[0]
+
+                    challenges = (conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'payment_required'",
+                        (since,),
+                    ).fetchone() or [0])[0]
+
+                    fails = (conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'payment_failed'",
+                        (since,),
+                    ).fetchone() or [0])[0]
+
+                    ep_rows = conn.execute(
+                        f"SELECT endpoint, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid' "
+                        f"GROUP BY endpoint ORDER BY COUNT(*) DESC",
+                        (since,),
+                    ).fetchall()
+
+                    client_rows = conn.execute(
+                        f"SELECT user_agent, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid' "
+                        f"GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 20",
+                        (since,),
+                    ).fetchall()
+
+                    daily_rows = conn.execute(
+                        f"SELECT SUBSTR(timestamp, 1, 10), COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid' "
+                        f"GROUP BY SUBSTR(timestamp, 1, 10) ORDER BY 1",
+                        (since,),
+                    ).fetchall()
+
+                    avg = (conn.execute(
+                        f"SELECT AVG(duration_ms) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid' "
+                        f"AND duration_ms > 0",
+                        (since,),
+                    ).fetchone() or [0])[0]
+
+                    _process_rows(paid, challenges, fails, ep_rows,
+                                  client_rows, daily_rows, avg)
             except Exception:
                 pass
 

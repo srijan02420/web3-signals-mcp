@@ -573,10 +573,22 @@ app = FastAPI(
 # Usage Tracking Middleware
 # ---------------------------------------------------------------------------
 class UsageTrackingMiddleware(BaseHTTPMiddleware):
-    """Logs every API request for analytics — user-agent, endpoint, duration."""
+    """Logs every API request for analytics — user-agent, endpoint, duration.
 
-    # Skip tracking for static/noisy paths
+    x402 payment awareness: detects paid calls (payment-signature header
+    present + 200 on a paid route) vs. 402 payment-required responses.
+    """
+
     SKIP_PATHS = {"/favicon.ico", "/openapi.json"}
+    PAID_PATHS = {"/signal", "/performance/reputation"}  # prefix-matched
+
+    def _is_paid_path(self, path: str) -> bool:
+        """Check if a path is an x402-gated route."""
+        if path in self.PAID_PATHS:
+            return True
+        if path.startswith("/signal/") and path != "/signal/":
+            return True
+        return False
 
     async def dispatch(self, request: Request, call_next):
         start = time.time()
@@ -587,6 +599,23 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         if path in self.SKIP_PATHS:
             return response
 
+        # Detect x402 payment context
+        is_paid_route = self._is_paid_path(path)
+        has_payment_header = bool(request.headers.get("payment-signature", ""))
+        status = response.status_code
+
+        # Classify the x402 payment state
+        if is_paid_route and status == 402:
+            payment_status = "payment_required"
+        elif is_paid_route and has_payment_header and status == 200:
+            payment_status = "paid"
+        elif is_paid_route and has_payment_header and status != 200:
+            payment_status = "payment_failed"
+        elif is_paid_route and not has_payment_header and status == 200:
+            payment_status = "free"  # x402 disabled or bypassed
+        else:
+            payment_status = None  # not a paid route
+
         # Fire-and-forget: don't slow down the response
         try:
             if _store:
@@ -596,9 +625,10 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     endpoint=path,
                     method=request.method,
                     user_agent=ua,
-                    status_code=response.status_code,
+                    status_code=status,
                     duration_ms=round(duration_ms, 1),
                     client_ip=client_ip,
+                    payment_status=payment_status,
                 )
         except Exception:
             pass  # Never break the response for tracking
@@ -633,6 +663,7 @@ async def root():
             "/performance": "Overall accuracy overview (free)",
             "/performance/{asset}": "Per-asset accuracy breakdown",
             "/analytics": "API usage analytics — who's using us, request trends",
+            "/analytics/x402": "x402 payment analytics — paid calls, revenue, conversion rate",
             "/api/history": "Paginated history of all agent runs",
         },
         "discovery": {
@@ -974,6 +1005,9 @@ async def get_analytics(days: int = Query(7, ge=1, le=90, description="Number of
 
     stats = _store.load_api_analytics(days=days)
 
+    # Include x402 payment summary in main analytics
+    x402_stats = _store.load_x402_analytics(days=days)
+
     return {
         "status": "active",
         "window_days": days,
@@ -984,6 +1018,57 @@ async def get_analytics(days: int = Query(7, ge=1, le=90, description="Number of
         "by_client_type": stats["by_user_agent_type"],
         "requests_per_day": stats["requests_per_day"],
         "top_user_agents": stats["top_user_agents"],
+        "x402_payments": {
+            "total_paid_calls": x402_stats["total_paid_calls"],
+            "estimated_revenue_usdc": x402_stats["estimated_revenue_usdc"],
+            "total_402_challenges": x402_stats["total_402_challenges"],
+            "conversion_rate_pct": (
+                round(x402_stats["total_paid_calls"] / x402_stats["total_402_challenges"] * 100, 1)
+                if x402_stats["total_402_challenges"] > 0 else 0
+            ),
+            "detail_endpoint": "/analytics/x402",
+        },
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/x402 — x402 payment analytics
+# ---------------------------------------------------------------------------
+@app.get("/analytics/x402", tags=["analytics"])
+async def get_x402_analytics(
+    days: int = Query(30, ge=1, le=90, description="Number of days to aggregate"),
+):
+    """
+    x402 payment analytics — paid calls, revenue, conversion rate, top paying clients.
+    Tracks every x402 micropayment through the system.
+    """
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    stats = _store.load_x402_analytics(days=days)
+    total_challenges = stats["total_402_challenges"]
+    total_paid = stats["total_paid_calls"]
+    conversion = (
+        round(total_paid / total_challenges * 100, 1)
+        if total_challenges > 0 else 0
+    )
+
+    return {
+        "status": "active",
+        "window_days": days,
+        "x402_enabled": _X402_ENABLED,
+        "price_per_call": "$0.001 USDC",
+        "network": "Base (eip155:8453)",
+        "total_paid_calls": total_paid,
+        "total_402_challenges": total_challenges,
+        "total_payment_failures": stats["total_payment_failures"],
+        "conversion_rate_pct": conversion,
+        "estimated_revenue_usdc": stats["estimated_revenue_usdc"],
+        "by_endpoint": stats["by_endpoint"],
+        "by_client_type": stats["by_client_type"],
+        "paid_per_day": stats["paid_per_day"],
+        "avg_paid_latency_ms": stats["avg_paid_latency_ms"],
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
