@@ -19,6 +19,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import threading
@@ -278,13 +279,16 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
             logger.error("  whale_agent: import error — %s", e)
 
         ran_any = False
+        agent_timeout = int(os.getenv("AGENT_TIMEOUT_SEC", "120"))
         for name, factory in agents:
             if not _should_run_agent(name):
                 logger.debug("  %s: skipped (cadence not elapsed)", name)
                 continue
             try:
                 agent = factory()
-                result = agent.execute()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(agent.execute)
+                    result = future.result(timeout=agent_timeout)
                 store.save(name, result)
                 _agent_last_run[name] = time.time()
                 ran_any = True
@@ -292,6 +296,8 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 ms = result["meta"]["duration_ms"]
                 errs = len(result["meta"]["errors"])
                 logger.info("  %s: %s (%sms, %s errors)", name, status, ms, errs)
+            except concurrent.futures.TimeoutError:
+                logger.error("  %s: TIMEOUT after %ss", name, agent_timeout)
             except Exception as exc:
                 logger.error("  %s: CRASH — %s", name, exc)
 
