@@ -696,7 +696,7 @@ async function fetchAll() {
     }
   } catch (e) {
     clearTimeout(loadTimer);
-    dbgLog('ERROR: ' + (e.message || e) + ' | ' + (e.stack || '').split('\n')[0]);
+    dbgLog('ERROR: ' + (e.message || e));
     document.getElementById('statusDot').className = 'status-dot offline';
     document.getElementById('lastUpdate').textContent = 'Connection error';
     content.innerHTML = `<div class="loading">
