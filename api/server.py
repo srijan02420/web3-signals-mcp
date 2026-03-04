@@ -603,14 +603,17 @@ def _get_real_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+_OWN_HOSTS = {"web3-signals-api-production.up.railway.app", "localhost", "127.0.0.1"}
+
 def _classify_request_source(request: Request) -> str:
     """Classify request as 'internal', 'external', or 'unknown'.
 
     Detection layers (first match wins):
     1. X-Internal-Key header matches INTERNAL_API_KEY env var -> internal
-    2. Dashboard/internal API paths -> internal
-    3. Postman without payment header -> internal
-    4. Everything else -> external
+    2. Referer from our own domain (dashboard AJAX calls) -> internal
+    3. Dashboard / admin / analytics paths -> internal
+    4. Postman / curl without payment header -> internal
+    5. Everything else -> external
     """
     # Layer 1: Explicit header (most reliable)
     if _INTERNAL_API_KEY:
@@ -618,20 +621,29 @@ def _classify_request_source(request: Request) -> str:
         if internal_header == _INTERNAL_API_KEY:
             return "internal"
 
-    # Layer 2: Internal API paths
-    path = request.url.path
-    if path.startswith("/api/") or path == "/dashboard":
+    # Layer 2: Referer from our own domain = dashboard making API calls
+    referer = (request.headers.get("referer", "") or "").lower()
+    if any(host in referer for host in _OWN_HOSTS):
         return "internal"
 
-    # Layer 3: Development tool user-agents (only when NO payment header)
+    # Layer 3: Internal / admin paths (not used by external agents)
+    path = request.url.path
+    if (path.startswith("/api/") or path == "/dashboard"
+            or path.startswith("/analytics") or path == "/health"
+            or path.startswith("/admin") or path.startswith("/.well-known")
+            or path == "/robots.txt" or path == "/docs"
+            or path == "/openapi.json"):
+        return "internal"
+
+    # Layer 4: Development tool user-agents (only when NO payment header)
     ua = (request.headers.get("user-agent", "") or "").lower()
     has_payment = bool(request.headers.get("payment-signature", ""))
 
     if not has_payment:
-        if "postman" in ua:
+        if "postman" in ua or "curl" in ua:
             return "internal"
 
-    # Layer 4: Everything else is external
+    # Layer 5: Everything else is a real external call
     return "external"
 
 
