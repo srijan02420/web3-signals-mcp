@@ -280,15 +280,15 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
 
         ran_any = False
         agent_timeout = int(os.getenv("AGENT_TIMEOUT_SEC", "120"))
+        _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         for name, factory in agents:
             if not _should_run_agent(name):
                 logger.debug("  %s: skipped (cadence not elapsed)", name)
                 continue
             try:
                 agent = factory()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(agent.execute)
-                    result = future.result(timeout=agent_timeout)
+                future = _agent_executor.submit(agent.execute)
+                result = future.result(timeout=agent_timeout)
                 store.save(name, result)
                 _agent_last_run[name] = time.time()
                 ran_any = True
@@ -297,9 +297,14 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 errs = len(result["meta"]["errors"])
                 logger.info("  %s: %s (%sms, %s errors)", name, status, ms, errs)
             except concurrent.futures.TimeoutError:
-                logger.error("  %s: TIMEOUT after %ss", name, agent_timeout)
+                logger.error("  %s: TIMEOUT after %ss — skipping", name, agent_timeout)
+                # Cancel the future and recreate executor to abandon hung thread
+                future.cancel()
+                _agent_executor.shutdown(wait=False)
+                _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             except Exception as exc:
                 logger.error("  %s: CRASH — %s", name, exc)
+        _agent_executor.shutdown(wait=False)
 
         # Run signal fusion only if at least one agent produced new data
         if ran_any:
