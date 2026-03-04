@@ -1606,7 +1606,7 @@ async def get_signal_health():
     result["change_log"] = change_log[-10:]
 
     # 6. Config version (from latest fusion result)
-    latest_fusion = _store.load("signal_fusion")
+    latest_fusion = _store.load_latest("signal_fusion")
     if latest_fusion:
         meta = latest_fusion.get("meta", {})
         result["config_version"] = meta.get("config_version")
