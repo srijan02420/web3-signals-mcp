@@ -92,6 +92,7 @@ class NarrativeAgent(BaseAgent):
             "top_headlines": [],
             "keyword_sentiment": 0.0,
             "llm_sentiment": None,
+            "llm_events": [],
             "community_sentiment": None,
             "influencer_mentions": 0,
             "top_influencers_active": [],
@@ -227,8 +228,9 @@ class NarrativeAgent(BaseAgent):
 
             keyword_sent = self._score_sentiment(headlines.get(sym, []), sentiment_cfg)
 
-            # Load cached LLM sentiment (from 12h cycle)
+            # Load cached LLM sentiment and events (from 12h cycle)
             llm_sent = self._load_cached_llm_sentiment(sym)
+            llm_events = self._load_cached_llm_events(sym)
 
             # Community sentiment from CryptoPanic
             cs = community_sentiment.get(sym, {})
@@ -256,6 +258,7 @@ class NarrativeAgent(BaseAgent):
                 "top_headlines": headlines.get(sym, [])[:8],
                 "keyword_sentiment": keyword_sent,
                 "llm_sentiment": llm_sent,
+                "llm_events": llm_events or [],
                 "community_sentiment": {
                     "bullish": cs.get("bullish", 0),
                     "bearish": cs.get("bearish", 0),
@@ -701,6 +704,61 @@ class NarrativeAgent(BaseAgent):
     # LLM Sentiment — 12-hour batch cycle (called from orchestrator)
     # ------------------------------------------------------------------ #
 
+    def _filter_headlines(self, headlines: List[str]) -> List[str]:
+        """Score and filter headlines by news-worthiness before LLM processing.
+
+        Prioritizes material news (regulatory, hacks, partnerships) over
+        generic discussion posts ("should I buy BTC?"). Config-driven from
+        YAML ``llm_sentiment.headline_filter``.
+        """
+        filter_cfg = self.profile.get("llm_sentiment", {}).get("headline_filter", {})
+        if not filter_cfg.get("enabled", False) or not headlines:
+            return headlines
+
+        max_count = int(filter_cfg.get("max_per_asset", 10))
+        min_score = float(filter_cfg.get("min_relevance_score", -3.0))
+        boost_keywords = filter_cfg.get("boost_keywords", [])
+        noise_patterns = filter_cfg.get("noise_patterns", [])
+        question_penalty = float(filter_cfg.get("question_penalty", -3.0))
+        short_penalty = float(filter_cfg.get("short_headline_penalty", -2.0))
+        short_threshold = int(filter_cfg.get("short_headline_threshold", 20))
+        number_bonus = float(filter_cfg.get("number_bonus", 1.0))
+
+        scored: List[Tuple[float, str]] = []
+        for h in headlines:
+            text = h.lower()
+            score = 0.0
+
+            # Boost for event-signal keywords
+            for kw in boost_keywords:
+                if kw in text:
+                    score += 2.0
+
+            # Penalize noise patterns
+            for pattern in noise_patterns:
+                if pattern in text:
+                    score -= 5.0
+
+            # Penalize questions (usually discussion, not news)
+            if text.rstrip().endswith("?"):
+                score += question_penalty
+
+            # Penalize very short headlines
+            if len(text) < short_threshold:
+                score += short_penalty
+
+            # Bonus for containing numbers (specific data points)
+            if number_bonus > 0 and any(c.isdigit() for c in text):
+                score += number_bonus
+
+            scored.append((score, h))
+
+        # Sort by relevance score descending
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        # Drop below minimum threshold, take top N
+        return [h for s, h in scored if s >= min_score][:max_count]
+
     def run_llm_sentiment(self, store) -> Dict[str, Any]:
         """
         Run LLM-based sentiment analysis on all collected headlines.
@@ -727,12 +785,19 @@ class NarrativeAgent(BaseAgent):
         results = {}
 
         # Batch all assets into one LLM call for cost efficiency
+        # Pre-filter headlines to remove noise before sending to LLM
         batch_input = {}
+        total_raw = 0
+        total_filtered = 0
         for sym in self.assets:
             asset_data = by_asset.get(sym, {})
             all_headlines = asset_data.get("top_headlines", [])
             if all_headlines:
-                batch_input[sym] = all_headlines[:10]  # Top 10 headlines per asset
+                total_raw += len(all_headlines)
+                filtered = self._filter_headlines(all_headlines)
+                total_filtered += len(filtered)
+                if filtered:
+                    batch_input[sym] = filtered
 
         if not batch_input:
             return {"skipped": True, "reason": "no headlines to analyze"}
@@ -742,6 +807,12 @@ class NarrativeAgent(BaseAgent):
             "cryptocurrency and provide structured sentiment analysis."
         ))
 
+        # Event types for classification
+        event_types = llm_cfg.get("event_types", [
+            "regulatory", "hack_exploit", "partnership", "listing",
+            "upgrade", "adoption", "market_event", "general_sentiment",
+        ])
+
         user_prompt = (
             "Analyze the following crypto headlines per asset and return a JSON object. "
             "For each asset, provide:\n"
@@ -749,10 +820,20 @@ class NarrativeAgent(BaseAgent):
             "- confidence: float from 0.0 to 1.0\n"
             "- dominant_narrative: string (1-3 words describing the main narrative)\n"
             "- narrative_topics: list of string tags (e.g. ['etf', 'regulation', 'defi'])\n"
-            "- tone: 'bullish', 'bearish', or 'neutral'\n\n"
+            "- tone: 'bullish', 'bearish', or 'neutral'\n"
+            "- events: list of significant events extracted from headlines. "
+            "Each event is an object with:\n"
+            "  - type: one of " + json.dumps(event_types) + "\n"
+            "  - headline: the original headline (shortened)\n"
+            "  - impact: 'bullish' or 'bearish'\n"
+            "  - magnitude: 'critical', 'high', 'medium', or 'low'\n"
+            "  - confidence: float 0.0-1.0 (how confident you are in the classification)\n"
+            "\nOnly include events that represent MATERIAL news (not generic sentiment). "
+            "A regulatory ruling, ETF approval, major hack, or institutional adoption "
+            "is an event. Generic 'BTC price analysis' is NOT an event.\n\n"
             "Headlines by asset:\n"
             f"{json.dumps(batch_input, indent=1)}\n\n"
-            "Return ONLY valid JSON like: {\"BTC\": {\"sentiment\": 0.5, ...}, ...}"
+            "Return ONLY valid JSON like: {\"BTC\": {\"sentiment\": 0.5, \"events\": [...], ...}, ...}"
         )
 
         try:
@@ -797,7 +878,12 @@ class NarrativeAgent(BaseAgent):
                 "results": results,
             })
 
-            return {"success": True, "assets_analyzed": len(results)}
+            return {
+                "success": True,
+                "assets_analyzed": len(results),
+                "headlines_raw": total_raw,
+                "headlines_filtered": total_filtered,
+            }
 
         except Exception as exc:
             return {"error": str(exc)}
@@ -821,6 +907,33 @@ class NarrativeAgent(BaseAgent):
 
             results = cached.get("results", {})
             return results.get(asset)
+        except Exception:
+            return None
+
+    def _load_cached_llm_events(self, asset: str) -> Optional[List[Dict[str, Any]]]:
+        """Load cached LLM events for an asset from storage."""
+        try:
+            from shared.storage import Storage
+            store = Storage()
+            cached = store.load_kv_json("llm_sentiment", "latest")
+            if not cached:
+                return None
+
+            # Check staleness (same as sentiment)
+            ts = cached.get("timestamp", "")
+            if ts:
+                cached_time = datetime.fromisoformat(ts)
+                max_age_hours = int(self.profile.get("llm_sentiment", {}).get("max_age_hours", 24))
+                if (datetime.now(timezone.utc) - cached_time).total_seconds() > max_age_hours * 3600:
+                    return None
+
+            results = cached.get("results", {})
+            asset_data = results.get(asset)
+            if asset_data and isinstance(asset_data, dict):
+                events = asset_data.get("events", [])
+                if isinstance(events, list):
+                    return events
+            return None
         except Exception:
             return None
 

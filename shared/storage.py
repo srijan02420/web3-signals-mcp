@@ -12,6 +12,42 @@ import traceback
 logger = logging.getLogger("web3signals.storage")
 
 
+# ------------------------------------------------------------------ #
+#  Ranking / correlation helpers for IC computation (no scipy needed)
+# ------------------------------------------------------------------ #
+
+def _rank_array(values: list) -> list:
+    """Assign average ranks to values (handles ties). Equivalent to scipy.stats.rankdata."""
+    n = len(values)
+    indexed = sorted(range(n), key=lambda i: values[i])
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        while j < n - 1 and values[indexed[j + 1]] == values[indexed[j]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0  # 1-based
+        for k in range(i, j + 1):
+            ranks[indexed[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson(x: list, y: list) -> Optional[float]:
+    """Pearson correlation between two lists. Returns None if degenerate."""
+    n = len(x)
+    if n < 3:
+        return None
+    mx = sum(x) / n
+    my = sum(y) / n
+    sx = sum((xi - mx) ** 2 for xi in x)
+    sy = sum((yi - my) ** 2 for yi in y)
+    if sx < 1e-12 or sy < 1e-12:
+        return None
+    sxy = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+    return sxy / (sx * sy) ** 0.5
+
+
 def _get_backend() -> str:
     """Return 'postgres' if DATABASE_URL is set, else 'sqlite'."""
     return "postgres" if os.getenv("DATABASE_URL") else "sqlite"
@@ -741,6 +777,245 @@ class Storage:
                 return row[0] if row else 0
             except Exception:
                 return 0
+
+    # ------------------------------------------------------------------ #
+    #  IC (Information Coefficient) tracking
+    # ------------------------------------------------------------------ #
+
+    def save_dimension_scores(self, snapshot_id: int, dimension_scores: Dict[str, float],
+                               config_version: str = "", regime: str = "") -> None:
+        """Store per-dimension numeric scores alongside a performance snapshot.
+
+        dimension_scores: e.g. {"whale": 42.5, "technical": 65.0, ...}
+        """
+        table = "ic_dimension_scores"
+        now = datetime.now(timezone.utc).isoformat()
+        payload = json.dumps(dimension_scores, ensure_ascii=True)
+
+        if self.backend == "postgres":
+            with _pg_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"CREATE TABLE IF NOT EXISTS {table} ("
+                        f"  id SERIAL PRIMARY KEY,"
+                        f"  snapshot_id INTEGER NOT NULL,"
+                        f"  dimension_scores TEXT NOT NULL,"
+                        f"  config_version TEXT DEFAULT '',"
+                        f"  regime TEXT DEFAULT '',"
+                        f"  timestamp TEXT NOT NULL"
+                        f")"
+                    )
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_{table}_snap ON {table} (snapshot_id)"
+                    )
+                    cur.execute(
+                        f"INSERT INTO {table} (snapshot_id, dimension_scores, config_version, "
+                        f"regime, timestamp) VALUES (%s, %s, %s, %s, %s)",
+                        (snapshot_id, payload, config_version, regime, now),
+                    )
+                conn.commit()
+        else:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {table} ("
+                    f"  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    f"  snapshot_id INTEGER NOT NULL,"
+                    f"  dimension_scores TEXT NOT NULL,"
+                    f"  config_version TEXT DEFAULT '',"
+                    f"  regime TEXT DEFAULT '',"
+                    f"  timestamp TEXT NOT NULL"
+                    f")"
+                )
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_snap ON {table} (snapshot_id)"
+                )
+                conn.execute(
+                    f"INSERT INTO {table} (snapshot_id, dimension_scores, config_version, "
+                    f"regime, timestamp) VALUES (?, ?, ?, ?, ?)",
+                    (snapshot_id, payload, config_version, regime, now),
+                )
+                conn.commit()
+
+    def compute_ic(self, window_hours: int = 24, days: int = 30) -> Dict[str, Any]:
+        """Compute Information Coefficient (Spearman rank correlation) per dimension.
+
+        For each evaluation point:
+          - Load dimension scores at signal time (from ic_dimension_scores)
+          - Load actual return (pct_change from performance_accuracy)
+          - Compute Spearman rank correlation across all assets at that point
+
+        Returns IC per dimension, per regime, and overall.
+        """
+        snap_table = "performance_snapshots"
+        acc_table = "performance_accuracy"
+        dim_table = "ic_dimension_scores"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        # Query: join snapshots + accuracy + dimension_scores
+        # Group by timestamp (rounded to nearest snapshot batch) to get cross-asset slices
+        query = (
+            f"SELECT s.id, s.asset, s.timestamp, s.signal_score, "
+            f"a.pct_change, d.dimension_scores, d.config_version, d.regime "
+            f"FROM {acc_table} a "
+            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+            f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+            f"WHERE s.timestamp >= {{since}} "
+            f"AND a.window_hours = {{window}} "
+            f"AND a.pct_change IS NOT NULL "
+            f"ORDER BY s.timestamp ASC"
+        )
+
+        rows = []
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT s.id, s.asset, s.timestamp, s.signal_score, "
+                            f"a.pct_change, d.dimension_scores, d.config_version, d.regime "
+                            f"FROM {acc_table} a "
+                            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                            f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                            f"WHERE s.timestamp >= %s "
+                            f"AND a.window_hours = %s "
+                            f"AND a.pct_change IS NOT NULL "
+                            f"ORDER BY s.timestamp ASC",
+                            (since, window_hours),
+                        )
+                        rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("compute_ic postgres error: %s", e)
+                return {"error": str(e), "dimensions": {}, "by_regime": {}, "overall_ic": None}
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    rows = conn.execute(
+                        f"SELECT s.id, s.asset, s.timestamp, s.signal_score, "
+                        f"a.pct_change, d.dimension_scores, d.config_version, d.regime "
+                        f"FROM {acc_table} a "
+                        f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                        f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                        f"WHERE s.timestamp >= ? "
+                        f"AND a.window_hours = ? "
+                        f"AND a.pct_change IS NOT NULL "
+                        f"ORDER BY s.timestamp ASC",
+                        (since, window_hours),
+                    ).fetchall()
+            except Exception as e:
+                logger.warning("compute_ic sqlite error: %s", e)
+                return {"error": str(e), "dimensions": {}, "by_regime": {}, "overall_ic": None}
+
+        if not rows:
+            return {"dimensions": {}, "by_regime": {}, "overall_ic": None,
+                    "total_observations": 0, "window_hours": window_hours}
+
+        # Parse rows into structured data
+        # Group by timestamp (snapshot batch) to compute cross-asset IC per slice
+        from collections import defaultdict
+
+        # Each row: (id, asset, timestamp, signal_score, pct_change, dim_scores_json, config_ver, regime)
+        # Group by timestamp to get "slices" of cross-asset data
+        slices = defaultdict(list)
+        for r in rows:
+            ts = r[2][:16]  # Truncate to minute precision for grouping
+            dim_scores = json.loads(r[5]) if isinstance(r[5], str) else r[5]
+            slices[ts].append({
+                "asset": r[1],
+                "composite": r[3],
+                "pct_change": r[4],
+                "dimensions": dim_scores,
+                "config_version": r[6],
+                "regime": r[7],
+            })
+
+        # Compute Spearman rank correlation per dimension
+        # IC = rank_correlation(dimension_score, future_return) across assets
+        all_dimensions = set()
+        for ts_data in slices.values():
+            for obs in ts_data:
+                all_dimensions.update(obs["dimensions"].keys())
+
+        # Collect per-dimension score-return pairs (across all slices)
+        dim_pairs: Dict[str, list] = {d: [] for d in all_dimensions}
+        dim_pairs["composite"] = []
+        regime_dim_pairs: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
+
+        for ts, observations in slices.items():
+            if len(observations) < 3:  # Need at least 3 assets for meaningful correlation
+                continue
+            returns = [obs["pct_change"] for obs in observations]
+            for dim in all_dimensions:
+                scores = [obs["dimensions"].get(dim, 50.0) for obs in observations]
+                dim_pairs[dim].append((scores, returns))
+            # Composite IC
+            composites = [obs["composite"] for obs in observations]
+            dim_pairs["composite"].append((composites, returns))
+            # Per-regime tracking
+            regime = observations[0]["regime"] if observations else ""
+            for dim in all_dimensions:
+                scores = [obs["dimensions"].get(dim, 50.0) for obs in observations]
+                regime_dim_pairs[regime][dim].append((scores, returns))
+            regime_dim_pairs[regime]["composite"].append((composites, returns))
+
+        def _spearman_ic(pairs: list) -> Optional[float]:
+            """Compute average Spearman IC across multiple cross-sectional slices."""
+            if not pairs:
+                return None
+            ics = []
+            for scores, returns in pairs:
+                n = len(scores)
+                if n < 3:
+                    continue
+                # Rank both arrays
+                score_ranks = _rank_array(scores)
+                return_ranks = _rank_array(returns)
+                # Spearman = Pearson of ranks
+                ic = _pearson(score_ranks, return_ranks)
+                if ic is not None:
+                    ics.append(ic)
+            return round(sum(ics) / len(ics), 4) if ics else None
+
+        # Compute IC per dimension
+        result_dims = {}
+        for dim in sorted(all_dimensions | {"composite"}):
+            ic = _spearman_ic(dim_pairs.get(dim, []))
+            n_slices = len(dim_pairs.get(dim, []))
+            result_dims[dim] = {"ic": ic, "slices": n_slices}
+
+            # IC Information Ratio (ICIR) = mean(IC) / std(IC)
+            if dim_pairs.get(dim):
+                slice_ics = []
+                for scores, returns in dim_pairs[dim]:
+                    if len(scores) >= 3:
+                        sr = _rank_array(scores)
+                        rr = _rank_array(returns)
+                        ic_val = _pearson(sr, rr)
+                        if ic_val is not None:
+                            slice_ics.append(ic_val)
+                if len(slice_ics) >= 2:
+                    mean_ic = sum(slice_ics) / len(slice_ics)
+                    std_ic = (sum((x - mean_ic) ** 2 for x in slice_ics) / len(slice_ics)) ** 0.5
+                    icir = round(mean_ic / std_ic, 3) if std_ic > 0.001 else None
+                    result_dims[dim]["icir"] = icir
+
+        # Compute IC per regime per dimension
+        result_regimes: Dict[str, Dict] = {}
+        for regime, dim_data in regime_dim_pairs.items():
+            result_regimes[regime] = {}
+            for dim in sorted(dim_data.keys()):
+                ic = _spearman_ic(dim_data[dim])
+                n_slices = len(dim_data[dim])
+                result_regimes[regime][dim] = {"ic": ic, "slices": n_slices}
+
+        return {
+            "dimensions": result_dims,
+            "by_regime": result_regimes,
+            "overall_ic": result_dims.get("composite", {}).get("ic"),
+            "total_observations": len(rows),
+            "total_slices": len(slices),
+            "window_hours": window_hours,
+            "days": days,
+        }
 
     def reset_accuracy_data(self) -> Dict[str, int]:
         """Drop and recreate accuracy table, reset snapshot evaluated flags.

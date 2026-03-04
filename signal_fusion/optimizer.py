@@ -1,17 +1,21 @@
 """
 Self-learning weight optimizer for signal fusion.
 
-Adjusts dimension weights based on rolling per-dimension accuracy.
-Better-performing dimensions get higher weights; poorly-performing ones get less.
+Adjusts dimension weights based on Information Coefficient (IC) —
+Spearman rank correlation between dimension scores and future returns.
 
-All config lives in YAML (learning section). This module only does generic math:
-  - Load per-dimension accuracy from kv_json
-  - Compute accuracy-proportional weights with bounds
+Phase 1: Accuracy-proportional (original)
+Phase 2: IC-based with auto-promote/demote and decay detection (current)
+
+All config lives in YAML (learning section). This module does:
+  - Load per-dimension IC from ic_tracking storage
+  - Compute IC-proportional weights with promote/demote rules
   - Apply EMA blending with previous weights
+  - Detect IC decay and log alerts
   - Store updated weights back to kv_json
 
 Integration:
-  - server.py calls optimizer after accuracy evaluation
+  - server.py calls optimizer after accuracy evaluation + IC computation
   - engine.py loads learned weights at fuse() time, overriding YAML defaults
 """
 from __future__ import annotations
@@ -26,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 
 class WeightOptimizer:
-    """Accuracy-proportional weight optimizer with EMA blending."""
+    """IC-based weight optimizer with auto-promote/demote and decay detection."""
 
     def __init__(self, store, profile: Dict[str, Any]) -> None:
         self.store = store
@@ -59,35 +63,43 @@ class WeightOptimizer:
         return new_evals >= optimize_every
 
     def compute_and_apply(self) -> Optional[Dict[str, float]]:
-        """Compute optimal weights and apply them. Returns new weights or None."""
+        """Compute optimal weights from IC data and apply them. Returns new weights or None."""
         if not self.enabled:
             return None
 
-        # Load per-dimension accuracy
-        dim_accuracy = self._load_dimension_accuracy()
-        if not dim_accuracy:
-            logger.warning("WeightOptimizer: no dimension accuracy data available")
+        # Load IC data (computed by storage.compute_ic, saved by server.py)
+        ic_data = self._load_ic_data()
+        if not ic_data:
+            # Fall back to accuracy-based optimization
+            logger.info("WeightOptimizer: no IC data, falling back to accuracy-based")
+            return self._compute_from_accuracy()
+
+        min_slices = int(self.cfg.get("min_ic_slices", 10))
+        total_slices = ic_data.get("total_slices", 0)
+        if total_slices < min_slices:
+            logger.info(f"WeightOptimizer: only {total_slices} IC slices, need {min_slices}")
             return None
 
-        min_evals = int(self.cfg.get("min_evaluations", 20))
-        total_evals = sum(d.get("count", 0) for d in dim_accuracy.values())
-        if total_evals < min_evals:
-            logger.info(f"WeightOptimizer: only {total_evals} evals, need {min_evals}")
-            return None
-
-        # Compute accuracy-proportional weights
-        new_weights = self._compute_optimal_weights(dim_accuracy)
+        # Compute IC-based weights with promote/demote
+        new_weights, reasons = self._compute_ic_weights(ic_data)
         if new_weights is None:
             return None
+
+        # Detect IC decay
+        self._detect_decay(ic_data)
 
         # EMA blend with previous weights
         blended = self._ema_blend(new_weights)
 
-        # Save and return
+        # Save weights, state, and change log
         self._save_weights(blended)
         self._save_state()
+        self._save_change_log(blended, reasons, ic_data)
 
-        logger.info(f"WeightOptimizer: updated weights: {blended}")
+        logger.info(f"WeightOptimizer [IC]: updated weights: {blended}")
+        for role, reason in reasons.items():
+            logger.info(f"  {role}: {reason}")
+
         return blended
 
     def get_current_weights(self) -> Optional[Dict[str, float]]:
@@ -98,19 +110,10 @@ class WeightOptimizer:
         return None
 
     def record_dimension_accuracy(self, dimension_scores: Dict[str, Dict[str, Any]]) -> None:
-        """
-        Record per-dimension accuracy data after an evaluation.
-
-        dimension_scores: {
-            "whale": {"score": 65.2, "direction": "bullish", "gradient_score": 0.7},
-            "technical": {"score": 42.1, "direction": "bearish", "gradient_score": 1.0},
-            ...
-        }
-        """
+        """Record per-dimension accuracy data after an evaluation (legacy support)."""
         if not self.enabled:
             return
 
-        # Load existing running stats
         existing = self.store.load_kv_json(self.namespace, "dimension_accuracy") or {}
 
         for role, data in dimension_scores.items():
@@ -126,8 +129,166 @@ class WeightOptimizer:
         self.store.save_kv_json(self.namespace, "dimension_accuracy", existing)
 
     # ------------------------------------------------------------------ #
-    #  Internal methods
+    #  IC-based optimization (Phase 2)
     # ------------------------------------------------------------------ #
+
+    def _load_ic_data(self) -> Optional[Dict[str, Any]]:
+        """Load the most recent IC computation from storage."""
+        # Try 24h window first, fall back to 48h
+        for window in ["ic_24h_30d", "ic_48h_30d"]:
+            data = self.store.load_kv_json("ic_tracking", window)
+            if data and data.get("dimensions"):
+                return data
+        return None
+
+    def _compute_ic_weights(
+        self, ic_data: Dict[str, Any]
+    ) -> Tuple[Optional[Dict[str, float]], Dict[str, str]]:
+        """Compute weights from IC values with auto-promote/demote.
+
+        Rules from YAML:
+          - ic_promote_threshold: IC above this → boost weight (default 0.03)
+          - ic_demote_threshold: IC below this → reduce weight (default 0.01)
+          - ic_disable_threshold: IC below this → minimize weight (default -0.02)
+          - promote_boost: multiplier for strong dimensions (default 1.3)
+          - demote_factor: multiplier for weak dimensions (default 0.5)
+          - disable_factor: multiplier for negative-IC dimensions (default 0.15)
+        """
+        promote_thresh = float(self.cfg.get("ic_promote_threshold", 0.03))
+        demote_thresh = float(self.cfg.get("ic_demote_threshold", 0.01))
+        disable_thresh = float(self.cfg.get("ic_disable_threshold", -0.02))
+        promote_boost = float(self.cfg.get("promote_boost", 1.3))
+        demote_factor = float(self.cfg.get("demote_factor", 0.5))
+        disable_factor = float(self.cfg.get("disable_factor", 0.15))
+        min_weight = float(self.cfg.get("min_weight", 0.05))
+        max_weight = float(self.cfg.get("max_weight", 0.40))
+
+        fallback = self.cfg.get("fallback_weights", {})
+        dimensions = ic_data.get("dimensions", {})
+
+        raw_weights: Dict[str, float] = {}
+        reasons: Dict[str, str] = {}
+
+        for role in self.all_roles:
+            base_w = float(fallback.get(role, 0.17))
+            dim_ic = dimensions.get(role, {})
+            ic_val = dim_ic.get("ic")
+            icir = dim_ic.get("icir")
+            n_slices = dim_ic.get("slices", 0)
+
+            if ic_val is None or n_slices < 5:
+                # Not enough data — keep fallback
+                raw_weights[role] = base_w
+                reasons[role] = f"insufficient data ({n_slices} slices) → fallback {base_w:.3f}"
+                continue
+
+            # Auto-promote/demote based on IC
+            if ic_val >= promote_thresh:
+                # Strong signal — boost
+                weight = base_w * promote_boost
+                # Extra boost for consistent IC (high ICIR)
+                if icir is not None and icir > 1.0:
+                    weight *= 1.1  # 10% bonus for consistency
+                reasons[role] = (
+                    f"PROMOTE: IC={ic_val:.4f} > {promote_thresh} "
+                    f"(ICIR={icir}, {n_slices} slices) → {weight:.3f}"
+                )
+            elif ic_val >= demote_thresh:
+                # Mediocre — keep base weight
+                weight = base_w
+                reasons[role] = (
+                    f"HOLD: IC={ic_val:.4f} in [{demote_thresh}, {promote_thresh}] "
+                    f"→ {weight:.3f}"
+                )
+            elif ic_val >= disable_thresh:
+                # Weak — reduce weight
+                weight = base_w * demote_factor
+                reasons[role] = (
+                    f"DEMOTE: IC={ic_val:.4f} < {demote_thresh} "
+                    f"({n_slices} slices) → {weight:.3f}"
+                )
+            else:
+                # Negative IC — minimize weight (actively hurting predictions)
+                weight = base_w * disable_factor
+                reasons[role] = (
+                    f"DISABLE: IC={ic_val:.4f} < {disable_thresh} "
+                    f"(negative signal, {n_slices} slices) → {weight:.3f}"
+                )
+
+            raw_weights[role] = weight
+
+        # Apply bounds and normalize
+        bounded = self._apply_bounds(raw_weights, min_weight, max_weight)
+        return bounded, reasons
+
+    def _detect_decay(self, ic_data: Dict[str, Any]) -> None:
+        """Compare current IC to previous IC and flag decaying dimensions."""
+        prev_ic_data = self.store.load_kv_json(self.namespace, "previous_ic")
+        if not prev_ic_data:
+            # Save current as baseline for next time
+            self.store.save_kv_json(self.namespace, "previous_ic", {
+                "dimensions": ic_data.get("dimensions", {}),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            return
+
+        decay_threshold = float(self.cfg.get("decay_threshold_pct", 50))
+        prev_dims = prev_ic_data.get("dimensions", {})
+        curr_dims = ic_data.get("dimensions", {})
+
+        alerts: List[str] = []
+        for role in self.all_roles:
+            prev_ic = (prev_dims.get(role, {}).get("ic") or 0)
+            curr_ic = (curr_dims.get(role, {}).get("ic") or 0)
+
+            if prev_ic > 0.01 and curr_ic < prev_ic:
+                decay_pct = ((prev_ic - curr_ic) / prev_ic) * 100
+                if decay_pct >= decay_threshold:
+                    alert = (
+                        f"DECAY ALERT: {role} IC dropped {decay_pct:.0f}% "
+                        f"({prev_ic:.4f} → {curr_ic:.4f})"
+                    )
+                    alerts.append(alert)
+                    logger.warning(f"WeightOptimizer: {alert}")
+
+        if alerts:
+            self.store.save_kv_json(self.namespace, "decay_alerts", {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "alerts": alerts,
+            })
+
+        # Update baseline for next comparison
+        self.store.save_kv_json(self.namespace, "previous_ic", {
+            "dimensions": ic_data.get("dimensions", {}),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        })
+
+    # ------------------------------------------------------------------ #
+    #  Accuracy-based fallback (Phase 1, for when IC data is unavailable)
+    # ------------------------------------------------------------------ #
+
+    def _compute_from_accuracy(self) -> Optional[Dict[str, float]]:
+        """Original accuracy-based optimization (fallback when IC not available)."""
+        dim_accuracy = self._load_dimension_accuracy()
+        if not dim_accuracy:
+            return None
+
+        min_evals = int(self.cfg.get("min_evaluations", 20))
+        total_evals = sum(d.get("count", 0) for d in dim_accuracy.values())
+        if total_evals < min_evals:
+            logger.info(f"WeightOptimizer: only {total_evals} evals, need {min_evals}")
+            return None
+
+        new_weights = self._compute_accuracy_weights(dim_accuracy)
+        if new_weights is None:
+            return None
+
+        blended = self._ema_blend(new_weights)
+        self._save_weights(blended)
+        self._save_state()
+
+        logger.info(f"WeightOptimizer [accuracy fallback]: updated weights: {blended}")
+        return blended
 
     def _load_dimension_accuracy(self) -> Optional[Dict[str, Dict[str, float]]]:
         """Load accumulated per-dimension accuracy stats."""
@@ -145,52 +306,37 @@ class WeightOptimizer:
 
         return result if result else None
 
-    def _compute_optimal_weights(self, dim_accuracy: Dict[str, Dict[str, float]]) -> Optional[Dict[str, float]]:
-        """
-        Compute weights proportional to dimension accuracy.
-
-        Method: accuracy_proportional
-        - weight_i = accuracy_i / sum(all accuracies)
-        - Bounded by min_weight and max_weight
-        - Redistributes any excess/deficit proportionally
-        """
-        method = self.cfg.get("method", "accuracy_proportional")
+    def _compute_accuracy_weights(
+        self, dim_accuracy: Dict[str, Dict[str, float]]
+    ) -> Optional[Dict[str, float]]:
+        """Compute weights proportional to accuracy (fallback method)."""
         min_weight = float(self.cfg.get("min_weight", 0.05))
         max_weight = float(self.cfg.get("max_weight", 0.40))
         fallback = self.cfg.get("fallback_weights", {})
 
-        if method != "accuracy_proportional":
-            logger.warning(f"WeightOptimizer: unknown method '{method}'")
-            return None
-
-        # Collect accuracies for all roles
         accuracies: Dict[str, float] = {}
         for role in self.all_roles:
             if role in dim_accuracy:
-                accuracies[role] = max(dim_accuracy[role]["accuracy"], 0.01)  # floor at 1%
+                accuracies[role] = max(dim_accuracy[role]["accuracy"], 0.01)
             else:
-                # Use fallback weight as proxy
                 accuracies[role] = float(fallback.get(role, 0.2))
 
         total_acc = sum(accuracies.values())
         if total_acc <= 0:
             return None
 
-        # Raw proportional weights
-        raw: Dict[str, float] = {}
-        for role in self.all_roles:
-            raw[role] = accuracies[role] / total_acc
+        raw = {role: accuracies[role] / total_acc for role in self.all_roles}
+        return self._apply_bounds(raw, min_weight, max_weight)
 
-        # Apply bounds with redistribution
-        bounded = self._apply_bounds(raw, min_weight, max_weight)
-        return bounded
+    # ------------------------------------------------------------------ #
+    #  Shared helpers
+    # ------------------------------------------------------------------ #
 
     def _apply_bounds(self, raw: Dict[str, float],
                        min_w: float, max_w: float) -> Dict[str, float]:
         """Apply min/max bounds and redistribute to sum to 1.0."""
         result = dict(raw)
 
-        # Iterative bounding (max 10 rounds)
         for _ in range(10):
             excess = 0.0
             deficit = 0.0
@@ -206,7 +352,6 @@ class WeightOptimizer:
                 else:
                     unbounded.append(role)
 
-            # Redistribute excess/deficit
             if unbounded and (excess > 0 or deficit > 0):
                 net = excess - deficit
                 unbounded_sum = sum(result[r] for r in unbounded)
@@ -214,24 +359,21 @@ class WeightOptimizer:
                     for role in unbounded:
                         result[role] += net * (result[role] / unbounded_sum)
 
-            # Check if sum is ~1.0
             total = sum(result.values())
             if abs(total - 1.0) < 0.001:
                 break
-            # Normalize
             for role in self.all_roles:
                 result[role] /= total
 
-        # Final normalize to exactly 1.0
+        # Final normalize
         total = sum(result.values())
         if total > 0:
             for role in self.all_roles:
                 result[role] = round(result[role] / total, 4)
 
-        # Ensure sum is exactly 1.0 (fix rounding)
+        # Fix rounding
         diff = 1.0 - sum(result.values())
         if abs(diff) > 0.0001:
-            # Add diff to largest weight
             max_role = max(result, key=result.get)
             result[max_role] = round(result[max_role] + diff, 4)
 
@@ -241,12 +383,10 @@ class WeightOptimizer:
         """Blend new weights with previous using EMA (exponential moving average)."""
         learning_rate = float(self.cfg.get("learning_rate", 0.3))
 
-        # Load previous weights
         prev_data = self.store.load_kv_json(self.namespace, "learned_weights")
         if prev_data and "weights" in prev_data:
             prev = prev_data["weights"]
         else:
-            # Use fallback weights as starting point
             prev = self.cfg.get("fallback_weights", {})
             if not prev:
                 prev = dict(self.profile.get("weights", {}))
@@ -255,10 +395,9 @@ class WeightOptimizer:
         for role in self.all_roles:
             old_w = float(prev.get(role, 0.2))
             new_w = float(new_weights.get(role, 0.2))
-            # EMA: blended = learning_rate * new + (1 - learning_rate) * old
             blended[role] = round(learning_rate * new_w + (1 - learning_rate) * old_w, 4)
 
-        # Normalize to sum to 1.0
+        # Normalize
         total = sum(blended.values())
         if total > 0:
             for role in self.all_roles:
@@ -287,11 +426,39 @@ class WeightOptimizer:
             "last_optimized_at": datetime.now(timezone.utc).isoformat(),
         })
 
+    def _save_change_log(
+        self,
+        weights: Dict[str, float],
+        reasons: Dict[str, str],
+        ic_data: Dict[str, Any],
+    ) -> None:
+        """Save a log entry of weight changes with reasons for transparency."""
+        # Load existing log (keep last 50 entries)
+        log = self.store.load_kv_json(self.namespace, "change_log") or []
+        if not isinstance(log, list):
+            log = []
+
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "weights": weights,
+            "reasons": reasons,
+            "ic_summary": {
+                role: ic_data.get("dimensions", {}).get(role, {}).get("ic")
+                for role in self.all_roles
+            },
+            "overall_ic": ic_data.get("overall_ic"),
+            "total_slices": ic_data.get("total_slices", 0),
+        }
+
+        log.append(entry)
+        log = log[-50:]  # Keep last 50
+
+        self.store.save_kv_json(self.namespace, "change_log", log)
+
     def _get_eval_count(self) -> int:
         """Get total evaluation count from dimension_accuracy stats."""
         data = self.store.load_kv_json(self.namespace, "dimension_accuracy")
         if not data:
             return 0
-        # Use max count across dimensions
         counts = [d.get("count", 0) for d in data.values() if isinstance(d, dict)]
         return max(counts) if counts else 0

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from urllib.request import Request, urlopen
 
 from shared.base_agent import BaseAgent
 from shared.profile_loader import load_profile, get_assets, get_threshold
+from shared.storage import Storage
 
 
 class DerivativesAgent(BaseAgent):
@@ -54,6 +55,11 @@ class DerivativesAgent(BaseAgent):
             "ls_status": "unknown",
             "funding_status": "unknown",
             "derivatives_condition": False,
+            # Lead indicators (computed from historical snapshots)
+            "funding_rate_change_4h": None,
+            "funding_rate_change_24h": None,
+            "oi_change_pct_4h": None,
+            "oi_change_pct_24h": None,
         }
 
     def collect(self) -> Tuple[Dict[str, Any], List[str]]:
@@ -133,6 +139,15 @@ class DerivativesAgent(BaseAgent):
                 and asset["funding_status"] in ("normal", "negative", "unknown")
             )
 
+        # --- Lead indicators: compute deltas from historical snapshots ---
+        try:
+            store = Storage()
+            history = store.load_history("derivatives_agent", limit=20)
+            if len(history) >= 2:
+                self._compute_deltas(data, history, errors)
+        except Exception as exc:
+            errors.append(f"lead indicators: {exc}")
+
         # Build summary
         healthy, overcrowded, bearish, high_fr = [], [], [], []
         for sym, asset in data["by_asset"].items():
@@ -154,6 +169,87 @@ class DerivativesAgent(BaseAgent):
         }
 
         return data, errors
+
+    # ------------------------------------------------------------------ #
+    # Lead indicator computation
+    # ------------------------------------------------------------------ #
+
+    def _compute_deltas(
+        self,
+        current_data: Dict[str, Any],
+        history: List[Dict[str, Any]],
+        errors: List[str],
+    ) -> None:
+        """Compute funding rate change and OI change from historical snapshots.
+
+        History is sorted newest-first. We find snapshots closest to 4h and 24h
+        ago and compute deltas against the current data.
+        """
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+
+        # Parse timestamps from history and index by age in hours
+        timed: List[Tuple[float, Dict[str, Any]]] = []
+        for snap in history:
+            ts_str = snap.get("timestamp") or ""
+            try:
+                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                age_hours = (now - ts).total_seconds() / 3600
+                by_asset = snap.get("data", {}).get("data", {}).get("by_asset", {})
+                if not by_asset:
+                    by_asset = snap.get("data", {}).get("by_asset", {})
+                if by_asset:
+                    timed.append((age_hours, by_asset))
+            except Exception:
+                continue
+
+        if not timed:
+            return
+
+        # Find closest snapshot to each target window (with max tolerance)
+        targets = {"4h": (4.0, 1.5, 12.0), "24h": (24.0, 8.0, 48.0)}
+        closest: Dict[str, Optional[Dict[str, Any]]] = {}
+        for label, (target_h, min_age, max_age) in targets.items():
+            best = None
+            best_diff = float("inf")
+            for age_h, by_asset in timed:
+                if age_h < min_age or age_h > max_age:
+                    continue
+                diff = abs(age_h - target_h)
+                if diff < best_diff:
+                    best = by_asset
+                    best_diff = diff
+            closest[label] = best
+
+        # Compute deltas per asset
+        for sym in self.assets:
+            asset = current_data["by_asset"].get(sym, {})
+            cur_fr = asset.get("funding_rate")
+            cur_oi = asset.get("open_interest_usd")
+
+            for label, snap_data in closest.items():
+                if snap_data is None:
+                    continue
+                prev = snap_data.get(sym, {})
+                prev_fr = prev.get("funding_rate")
+                prev_oi = prev.get("open_interest_usd")
+
+                # Funding rate change (absolute delta)
+                if cur_fr is not None and prev_fr is not None:
+                    delta = cur_fr - prev_fr
+                    asset[f"funding_rate_change_{label}"] = round(delta, 8)
+
+                # OI change (percentage)
+                if cur_oi is not None and prev_oi is not None and prev_oi > 0:
+                    pct = ((cur_oi - prev_oi) / prev_oi) * 100
+                    asset[f"oi_change_pct_{label}"] = round(pct, 2)
+
+        n_with_delta = sum(
+            1 for sym in self.assets
+            if current_data["by_asset"].get(sym, {}).get("funding_rate_change_4h") is not None
+        )
+        errors.append(f"lead indicators: {n_with_delta}/{len(self.assets)} assets have 4h deltas")
 
     # ------------------------------------------------------------------ #
     # HTTP helper

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import time
@@ -10,6 +11,21 @@ from urllib.request import Request, urlopen
 
 from shared.profile_loader import load_profile
 from shared.storage import Storage
+
+
+def _fg_regime(fg_value: Optional[float]) -> str:
+    """Classify Fear & Greed index into a regime label."""
+    if fg_value is None:
+        return "unknown"
+    if fg_value <= 20:
+        return "extreme_fear"
+    if fg_value <= 40:
+        return "fear"
+    if fg_value <= 60:
+        return "neutral"
+    if fg_value <= 80:
+        return "greed"
+    return "extreme_greed"
 
 
 class SignalFusion:
@@ -26,6 +42,13 @@ class SignalFusion:
         self.assets: List[str] = [a.upper() for a in self.profile.get("assets", [])]
         self.store = Storage(db_path)
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+
+        # Config versioning: SHA256 hash of the scoring YAML for signal attribution
+        yaml_path = Path(profile_path) if profile_path else default
+        try:
+            self.config_hash = hashlib.sha256(yaml_path.read_bytes()).hexdigest()[:12]
+        except Exception:
+            self.config_hash = "unknown"
 
     def fuse(self) -> Dict[str, Any]:
         """Main entry: load latest agent data, score, label, summarise."""
@@ -78,26 +101,17 @@ class SignalFusion:
         signals: Dict[str, Dict[str, Any]] = {}
         all_roles = ["whale", "technical", "derivatives", "narrative", "market", "trend"]
 
-        # Load delta scorer (YAML-driven change detection)
-        delta_scorer = None
-        prev_signals: Dict[str, Dict] = {}
-        delta_cfg = self.profile.get("delta_scoring", {})
-        if delta_cfg.get("enabled", False):
-            try:
-                from signal_fusion.delta import DeltaScorer
-                delta_scorer = DeltaScorer(self.profile)
-                # Load previous fusion run's signals for delta comparison
-                prev_run = self.store.load_latest("signal_fusion")
-                if prev_run:
-                    prev_signals = prev_run.get("data", {}).get("signals", {})
-            except Exception as exc:
-                errors.append(f"delta scorer: {exc}")
-
         # Dynamic reweighting config (from YAML)
         reweight_cfg = self.profile.get("reweighting", {})
         reweight_enabled = reweight_cfg.get("enabled", False)
         tier_multipliers = reweight_cfg.get("tier_multipliers", {"full": 1.0, "partial": 0.5, "none": 0.0})
         agent_reweight_rules = reweight_cfg.get("agents", {})
+
+        # --- Extract Fear & Greed value (used by regime scoring + signal tagging) ---
+        fg_value = None
+        _market_fg = raw.get("market")
+        if _market_fg:
+            fg_value = _market_fg.get("data", {}).get("sentiment", {}).get("fear_greed_index")
 
         # --- Phase 6 pre-compute: Dynamic abstain threshold (F&G-driven) ---
         # Resolve the abstain threshold ONCE before the asset loop.
@@ -106,14 +120,8 @@ class SignalFusion:
         abstain_cfg = self.profile.get("abstain", {})
         base_min_distance = float(abstain_cfg.get("min_distance_from_center", 8))
         dynamic_cfg = abstain_cfg.get("dynamic", {})
-        fg_value = None  # Fear & Greed index (0-100)
 
         if dynamic_cfg.get("enabled", False):
-            # Extract F&G from market agent data
-            market_data = raw.get("market")
-            if market_data:
-                fg_value = market_data.get("data", {}).get("sentiment", {}).get("fear_greed_index")
-
             if fg_value is not None:
                 # Find matching zone
                 resolved_distance = base_min_distance  # fallback
@@ -234,6 +242,44 @@ class SignalFusion:
             else:
                 errors.append("regime: BTC data unavailable")
 
+        # --- F&G Regime-First Scoring pre-compute ---
+        # Shift weights and dampen scores based on the Fear & Greed regime.
+        # In fear: boost pro-trend, suppress contrarian.
+        # In greed: boost contrarian, suppress pro-trend.
+        fg_regime_cfg = self.profile.get("fg_regime_scoring", {})
+        fg_regime = _fg_regime(fg_value)
+        fg_regime_overrides: Dict[str, Any] = {}
+        fg_weight_shifts: Dict[str, float] = {}
+        fg_score_dampening: Dict[str, Any] = {}
+
+        if fg_regime_cfg.get("enabled", False) and fg_regime != "unknown":
+            fg_regime_overrides = fg_regime_cfg.get(fg_regime, {})
+            fg_weight_shifts = {
+                k: float(v) for k, v in fg_regime_overrides.get("weight_shifts", {}).items()
+            }
+            fg_score_dampening = fg_regime_overrides.get("score_dampening", {})
+            # Override abstain distance with regime-specific value
+            if "abstain_distance" in fg_regime_overrides:
+                resolved_distance = float(fg_regime_overrides["abstain_distance"])
+            errors.append(
+                f"fg_regime_scoring: {fg_regime} (F&G={fg_value}) "
+                f"→ wt_shifts={{{', '.join(f'{k}:{v}' for k, v in fg_weight_shifts.items())}}}, "
+                f"abstain={resolved_distance}, "
+                f"dampening={'on(factor=' + str(fg_score_dampening.get('factor', '-')) + ')' if fg_score_dampening.get('enabled') else 'off'}"
+            )
+
+        # Pre-inject market price changes into derivatives data for OI-price divergence
+        _deriv_data = raw.get("derivatives")
+        _market_data = raw.get("market")
+        if _deriv_data and _market_data:
+            d_by_asset = _deriv_data.get("data", {}).get("by_asset", {})
+            m_by_asset = _market_data.get("data", {}).get("per_asset", {})
+            for sym in self.assets:
+                d_asset = d_by_asset.get(sym)
+                m_asset = m_by_asset.get(sym)
+                if d_asset and m_asset:
+                    d_asset["_price_change_24h"] = m_asset.get("change_24h_pct")
+
         for asset in self.assets:
             # --- Phase 1: Score ALL dimensions first ---
             raw_scores: Dict[str, Tuple[float, str]] = {}
@@ -306,6 +352,16 @@ class SignalFusion:
                     for role in all_roles:
                         base_weights[role] = base_weights[role] / total_w
 
+            # F&G regime weight shifts: fear → pro-trend, greed → contrarian
+            if fg_regime_cfg.get("enabled", False) and fg_weight_shifts:
+                for role in all_roles:
+                    shift = fg_weight_shifts.get(role, 1.0)
+                    base_weights[role] *= shift
+                total_w = sum(base_weights.values())
+                if total_w > 0:
+                    for role in all_roles:
+                        base_weights[role] /= total_w
+
             # Apply tier multipliers to ALL agents, then redistribute freed weight
             adjusted_weights: Dict[str, float] = {}
             total_freed = 0.0
@@ -348,6 +404,17 @@ class SignalFusion:
                     score = 50.0 + (score - 50.0) * trend_dampening
                     detail = f"{detail}; trend dampened {original_score:.1f}→{score:.1f}"
 
+                # F&G regime score dampening: pull contrarian "buy" signals toward 50
+                # In fear markets, contrarian dims wrongly say "buy" — dampen those.
+                # In extreme greed, pro-trend dims wrongly say "keep buying" — dampen those.
+                if fg_score_dampening.get("enabled", False) and score > 50:
+                    sd_dims = fg_score_dampening.get("dimensions", [])
+                    if role in sd_dims:
+                        sd_factor = float(fg_score_dampening.get("factor", 1.0))
+                        original_score = score
+                        score = 50.0 + (score - 50.0) * sd_factor
+                        detail = f"{detail}; fg dampened {original_score:.1f}→{score:.1f}"
+
                 label_name, direction = self._classify(score, label_cfg)
                 adj_w = adjusted_weights[role]
 
@@ -387,117 +454,13 @@ class SignalFusion:
                 except Exception as exc:
                     errors.append(f"velocity {asset}: {exc}")
 
-            # --- Phase 5: Conviction multiplier ---
-            # When 3+ dimensions agree on direction, amplify composite away from 50.
-            # This breaks the "everything is neutral" clustering problem.
-            conviction_cfg = self.profile.get("conviction", {})
-            if conviction_cfg.get("enabled", True):
-                min_agreeing = int(conviction_cfg.get("min_agreeing_dimensions", 3))
-                boost_factor = float(conviction_cfg.get("boost_factor", 1.25))
-                center = 50.0
-
-                bullish_count = sum(1 for r in all_roles if raw_scores[r][0] > 55)
-                bearish_count = sum(1 for r in all_roles if raw_scores[r][0] < 45)
-
-                if bullish_count >= min_agreeing and composite > center:
-                    # Amplify distance from center
-                    distance = composite - center
-                    composite = round(center + distance * boost_factor, 1)
-                elif bearish_count >= min_agreeing and composite < center:
-                    distance = center - composite
-                    composite = round(center - distance * boost_factor, 1)
-
-                # Clamp to 0-100
-                composite = round(max(0.0, min(100.0, composite)), 1)
-                conviction_applied = bullish_count >= min_agreeing or bearish_count >= min_agreeing
-            else:
-                bullish_count = 0
-                bearish_count = 0
-                conviction_applied = False
-
-            # --- Phase 5b: Delta (change-detection) scoring ---
-            # Blend absolute composite with delta composite based on dimension changes.
-            delta_details = {}
-            if delta_scorer and delta_scorer.is_enabled():
-                prev_dims = prev_signals.get(asset, {}).get("dimensions")
-                delta_composite, delta_details = delta_scorer.compute_delta_composite(
-                    asset, dimensions, prev_dims
-                )
-                if delta_composite is not None:
-                    composite = delta_scorer.blend(composite, delta_composite)
-
-            # --- Phase 5c: Confidence scoring ---
-            # Multi-factor quality gate. If confidence < threshold, suppress signal.
-            confidence_cfg = self.profile.get("confidence", {})
-            confidence_score = None
-            confidence_suppressed = False
-
-            if confidence_cfg.get("enabled", False):
-                factors_cfg = confidence_cfg.get("factors", {})
-                confidence_threshold = float(confidence_cfg.get("threshold", 35))
-
-                # Factor 1: Dimension agreement
-                da_cfg = factors_cfg.get("dimension_agreement", {})
-                da_weight = float(da_cfg.get("weight", 0.35))
-                if composite > 50:
-                    agreeing = sum(1 for r in all_roles if raw_scores[r][0] > 50)
-                else:
-                    agreeing = sum(1 for r in all_roles if raw_scores[r][0] < 50)
-                total_dims = len(all_roles)
-                da_score = ((agreeing - 1) / max(total_dims - 1, 1)) * 100
-
-                # Factor 2: Signal strength (distance from 50)
-                ss_cfg = factors_cfg.get("signal_strength", {})
-                ss_weight = float(ss_cfg.get("weight", 0.25))
-                max_dist = float(ss_cfg.get("max_distance", 20))
-                distance = abs(composite - 50.0)
-                ss_score = min(distance / max_dist, 1.0) * 100
-
-                # Factor 3: Data quality
-                dq_cfg = factors_cfg.get("data_quality", {})
-                dq_weight = float(dq_cfg.get("weight", 0.25))
-                full_count = sum(1 for r in all_roles if data_tiers.get(r) == "full")
-                dq_score = (full_count / max(total_dims, 1)) * 100
-
-                # Factor 4: Velocity alignment
-                va_cfg = factors_cfg.get("velocity_alignment", {})
-                va_weight = float(va_cfg.get("weight", 0.15))
-                aligned_above = float(va_cfg.get("aligned_above", 0.8))
-                opposed_below = float(va_cfg.get("opposed_below", 0.5))
-                if velocity_result and velocity_result.get("dampening_factor") is not None:
-                    vdamp = velocity_result["dampening_factor"]
-                    if vdamp >= aligned_above:
-                        va_score = 100.0
-                    elif vdamp <= opposed_below:
-                        va_score = 0.0
-                    else:
-                        va_score = ((vdamp - opposed_below) / (aligned_above - opposed_below)) * 100
-                else:
-                    va_score = 70.0  # No velocity data = moderate confidence
-
-                confidence_score = round(
-                    da_score * da_weight +
-                    ss_score * ss_weight +
-                    dq_score * dq_weight +
-                    va_score * va_weight,
-                    1
-                )
-
-                if confidence_score < confidence_threshold:
-                    confidence_suppressed = True
-
-            # --- Phase 6: Abstain check ---
+            # --- Phase 5: Abstain check ---
             # Use the pre-computed resolved_distance (dynamic F&G-based or fallback).
             # When dynamic abstain changes the threshold, align MODERATE BUY/SELL
             # boundaries with the abstain zone edges so there's no dead gap.
             abstain_applied = False
             if abstain_cfg.get("enabled", False):
-                # Confidence gate: if confidence is below threshold, force abstain
-                if confidence_suppressed:
-                    abstain_applied = True
-                    label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
-                    direction = "neutral"
-                elif abs(composite - 50.0) < resolved_distance:
+                if abs(composite - 50.0) < resolved_distance:
                     abstain_applied = True
                     label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
                     direction = "neutral"
@@ -539,15 +502,13 @@ class SignalFusion:
                 "momentum": momentum,
                 "prev_score": round(prev_score, 1) if prev_score is not None else None,
                 "data_tiers": data_tiers,
-                "conviction_boost": conviction_applied,
                 "abstain": abstain_applied,
                 "abstain_threshold": resolved_distance,
                 "trend_dampened": is_downtrend,
                 "regime": detected_regime,
-                "confidence": confidence_score,
-                "confidence_suppressed": confidence_suppressed,
-                "delta": delta_details if delta_details else None,
                 "velocity": velocity_result if velocity_result else None,
+                "config_version": self.config_hash,
+                "regime_at_generation": _fg_regime(fg_value),
             }
 
             # Store current score for next momentum comparison
@@ -622,6 +583,8 @@ class SignalFusion:
                 "errors": errors,
                 "agents_available": [r for r, d in raw.items() if d is not None],
                 "agents_missing": [r for r, d in raw.items() if d is None],
+                "config_version": self.config_hash,
+                "regime_at_generation": _fg_regime(fg_value),
             },
         }
 
@@ -957,6 +920,54 @@ class SignalFusion:
                 score += combo_bonus
                 details.append("combo: contrarian+neg_funding")
 
+        # --- Lead indicator: Funding rate CHANGE (delta) ---
+        # The REVERSAL of funding is the signal, not the level.
+        # Funding contraction = pressure easing. Funding expansion = pressure building.
+        fr_chg_rules = rules.get("funding_rate_change", {})
+        if fr_chg_rules.get("enabled", False):
+            fr_chg = asset_data.get("funding_rate_change_4h")
+            if fr_chg is None:
+                fr_chg = asset_data.get("funding_rate_change_24h")
+            if fr_chg is not None:
+                # Positive delta = funding becoming more positive = shorts easing = bearish
+                # Negative delta = funding becoming more negative = squeeze building = bullish
+                threshold = float(fr_chg_rules.get("threshold", 0.00005))
+                max_pts = float(fr_chg_rules.get("max_points", 8))
+                if abs(fr_chg) > threshold:
+                    intensity = min(abs(fr_chg) / (threshold * 5), 1.0)
+                    pts = intensity * max_pts
+                    if fr_chg < 0:
+                        score += pts  # funding falling = bullish (squeeze building)
+                        details.append(f"fr_chg {fr_chg:+.6f} bullish")
+                    else:
+                        score -= pts  # funding rising = bearish (longs paying more)
+                        details.append(f"fr_chg {fr_chg:+.6f} bearish")
+
+        # --- Lead indicator: OI-price divergence ---
+        # OI rising + price flat/falling = conviction without result = pressure building
+        # OI falling + price rising = weak rally (no conviction) = bearish
+        oi_div_rules = rules.get("oi_price_divergence", {})
+        if oi_div_rules.get("enabled", False):
+            oi_chg = asset_data.get("oi_change_pct_4h") or asset_data.get("oi_change_pct_24h")
+            price_chg = asset_data.get("_price_change_24h")
+            if oi_chg is not None and price_chg is not None:
+                oi_thresh = float(oi_div_rules.get("oi_threshold_pct", 3.0))
+                price_thresh = float(oi_div_rules.get("price_threshold_pct", 2.0))
+                max_pts = float(oi_div_rules.get("max_points", 10))
+
+                # OI rising but price not following = breakout building
+                if oi_chg > oi_thresh and abs(price_chg) < price_thresh:
+                    score += max_pts
+                    details.append(f"OI÷price diverge: OI+{oi_chg:.1f}% price={price_chg:+.1f}%")
+                # OI falling but price rising = weak rally
+                elif oi_chg < -oi_thresh and price_chg > price_thresh:
+                    score -= max_pts
+                    details.append(f"OI÷price weak rally: OI{oi_chg:.1f}% price+{price_chg:.1f}%")
+                # OI falling with price falling = deleveraging (bearish confirmation)
+                elif oi_chg < -oi_thresh and price_chg < -price_thresh:
+                    score -= max_pts * 0.5
+                    details.append(f"OI÷price delever: OI{oi_chg:.1f}% price{price_chg:.1f}%")
+
         return min(100.0, max(0.0, score)), "; ".join(details) if details else "no deriv data"
 
     # ================================================================ #
@@ -1057,6 +1068,49 @@ class SignalFusion:
         if sources_with_data >= multi_threshold:
             score += multi_bonus
             details.append(f"{sources_with_data} sources")
+
+        # --- Component 7: LLM Event scoring ---
+        events = asset_data.get("llm_events", [])
+        event_rules = rules.get("event_scoring", {})
+        if event_rules.get("enabled", False) and events and isinstance(events, list):
+            type_weights = event_rules.get("type_weights", {})
+            mag_mult = event_rules.get("magnitude_multipliers", {})
+            max_events = int(event_rules.get("max_events_scored", 3))
+            max_ev_pts = float(event_rules.get("max_points", 20))
+
+            # Sort events by magnitude (critical > high > medium > low)
+            mag_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+            valid_events = [e for e in events if isinstance(e, dict)]
+            sorted_events = sorted(
+                valid_events,
+                key=lambda e: mag_order.get(e.get("magnitude", "low"), 0),
+                reverse=True,
+            )
+
+            event_pts = 0.0
+            scored_labels: List[str] = []
+            for ev in sorted_events[:max_events]:
+                ev_type = ev.get("type", "general_sentiment")
+                ev_impact = ev.get("impact", "neutral")
+                ev_mag = ev.get("magnitude", "low")
+                ev_conf = float(ev.get("confidence", 0.5))
+
+                base_w = float(type_weights.get(ev_type, 2))
+                mult = float(mag_mult.get(ev_mag, 0.3))
+                pts = base_w * mult * ev_conf
+
+                if ev_impact == "bearish":
+                    pts = -pts
+
+                event_pts += pts
+                scored_labels.append(f"{ev_type}:{ev_impact}")
+
+            # Clamp to max
+            event_pts = max(-max_ev_pts, min(max_ev_pts, event_pts))
+            score += event_pts
+
+            if scored_labels:
+                details.append(f"events({len(scored_labels)}): {', '.join(scored_labels[:2])}")
 
         max_score = float(rules.get("max_score", 100))
 

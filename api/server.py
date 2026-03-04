@@ -207,6 +207,33 @@ if _X402_ENABLED:
 # ---------------------------------------------------------------------------
 # Background orchestrator — runs all agents every N seconds
 # ---------------------------------------------------------------------------
+
+# Per-agent cadence: how often each agent should re-fetch (in minutes).
+# Agents whose cadence hasn't elapsed are skipped that cycle.
+# Env-overridable: AGENT_CADENCE_TECHNICAL_MIN=15, etc.
+_AGENT_CADENCES_MIN: dict[str, int] = {
+    "technical_agent":   15,   # Price action is fast, RSI/MACD shift on short candles
+    "derivatives_agent": 15,   # Lead indicators need frequent sampling (funding delta, OI div)
+    "whale_agent":       30,   # Whale transactions are sporadic, 30min catches everything
+    "market_agent":      30,   # F&G updates daily, CoinGecko dominance moves slowly
+    "narrative_agent":   60,   # Reddit/news don't change meaningfully every 15min
+}
+
+_agent_last_run: dict[str, float] = {}  # agent_name -> timestamp of last successful run
+
+
+def _should_run_agent(name: str) -> bool:
+    """Check if enough time has elapsed since this agent's last run."""
+    env_key = f"AGENT_CADENCE_{name.upper().replace('_AGENT', '')}_MIN"
+    cadence_min = int(os.getenv(env_key, str(_AGENT_CADENCES_MIN.get(name, 15))))
+    cadence_sec = cadence_min * 60
+
+    last = _agent_last_run.get(name)
+    if last is None:
+        return True  # first run — always execute
+    return (time.time() - last) >= cadence_sec
+
+
 def _orchestrator_loop(store: Storage, interval: int) -> None:
     """Background thread: run all 5 agents + save to storage."""
     global _orchestrator_running
@@ -250,11 +277,17 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
         except ImportError as e:
             logger.error("  whale_agent: import error — %s", e)
 
+        ran_any = False
         for name, factory in agents:
+            if not _should_run_agent(name):
+                logger.debug("  %s: skipped (cadence not elapsed)", name)
+                continue
             try:
                 agent = factory()
                 result = agent.execute()
                 store.save(name, result)
+                _agent_last_run[name] = time.time()
+                ran_any = True
                 status = result["status"]
                 ms = result["meta"]["duration_ms"]
                 errs = len(result["meta"]["errors"])
@@ -262,22 +295,26 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
             except Exception as exc:
                 logger.error("  %s: CRASH — %s", name, exc)
 
-        # Run signal fusion and save to storage (pre-computes so /signal is instant)
-        try:
-            fusion = SignalFusion()
-            fusion_result = fusion.fuse()
-            store.save("signal_fusion", fusion_result)
-            f_status = fusion_result.get("status", "unknown")
-            f_ms = fusion_result.get("meta", {}).get("duration_ms", 0)
-            logger.info("  signal_fusion: %s (%sms)", f_status, f_ms)
-        except Exception as exc:
-            logger.error("  signal_fusion: CRASH — %s", exc)
+        # Run signal fusion only if at least one agent produced new data
+        if ran_any:
+            try:
+                fusion = SignalFusion()
+                fusion_result = fusion.fuse()
+                store.save("signal_fusion", fusion_result)
+                f_status = fusion_result.get("status", "unknown")
+                f_ms = fusion_result.get("meta", {}).get("duration_ms", 0)
+                logger.info("  signal_fusion: %s (%sms)", f_status, f_ms)
+            except Exception as exc:
+                logger.error("  signal_fusion: CRASH — %s", exc)
+        else:
+            logger.info("  signal_fusion: skipped (no new agent data)")
 
-        # --- 12-hour LLM Sentiment Cycle ---
-        # Runs narrative LLM sentiment analysis every 12 hours (not every 15 min)
-        # to keep costs low (~$0.02/day vs $3-5/day at 15 min intervals)
+        # --- 24-hour LLM Event Extraction Cycle ---
+        # Runs narrative LLM event extraction once per day.
+        # This is the ONLY LLM call that enhances scores (via event scoring).
+        # Cost: ~$0.01/day. Override: LLM_SENTIMENT_CYCLE_HOURS=12 for faster.
         try:
-            llm_cycle_hours = int(os.getenv("LLM_SENTIMENT_CYCLE_HOURS", "12"))
+            llm_cycle_hours = int(os.getenv("LLM_SENTIMENT_CYCLE_HOURS", "24"))
             last_llm_run = store.load_kv("llm_cycle", "last_run")
             now_ts = time.time()
 
@@ -288,7 +325,7 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 should_run_llm = True
 
             if should_run_llm:
-                logger.info("  [LLM] Running 12-hour narrative sentiment analysis...")
+                logger.info("  [LLM] Running daily narrative event extraction...")
                 try:
                     from narrative_agent.engine import NarrativeAgent
                     narrator = NarrativeAgent()
@@ -321,6 +358,18 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 logger.info("  [PERF] Running accuracy evaluation...")
                 _evaluate_old_snapshots(store)
                 store.save_kv("perf_eval", "last_run", now_ts)
+
+                # Compute and cache IC (Information Coefficient) after accuracy eval
+                try:
+                    for wh in [24, 48]:
+                        ic_result = store.compute_ic(window_hours=wh, days=30)
+                        if ic_result.get("total_observations", 0) > 0:
+                            store.save_kv_json("ic_tracking", f"ic_{wh}h_30d", ic_result)
+                            logger.info("  [IC] %sh IC computed: overall=%.4f, %s observations",
+                                       wh, ic_result.get("overall_ic") or 0,
+                                       ic_result.get("total_observations", 0))
+                except Exception as ic_exc:
+                    logger.error("  IC computation: %s", ic_exc)
 
                 # Trigger weight optimizer after evaluation
                 try:
@@ -414,7 +463,7 @@ def _record_performance_snapshot(store: Storage) -> None:
                 dim_details.append(f"{dim_name}: {d}")
         full_detail = "; ".join(dim_details) if dim_details else ""
 
-        store.save_performance_snapshot(
+        snap_id = store.save_performance_snapshot(
             asset=asset,
             signal_score=score,
             signal_direction=direction,
@@ -422,6 +471,21 @@ def _record_performance_snapshot(store: Storage) -> None:
             sources_count=sources,
             detail=full_detail,
         )
+
+        # Save per-dimension numeric scores for IC tracking
+        if snap_id is not None:
+            dim_scores = {}
+            for dim_name, dim_data in sig.get("dimensions", {}).items():
+                s = dim_data.get("score")
+                if s is not None:
+                    dim_scores[dim_name] = float(s)
+            config_ver = sig.get("config_version", "")
+            regime = sig.get("regime_at_generation", "")
+            try:
+                store.save_dimension_scores(snap_id, dim_scores, config_ver, regime)
+            except Exception as dim_exc:
+                logger.warning("  dimension scores save failed: %s", dim_exc)
+
         saved += 1
 
     if saved:
@@ -664,7 +728,7 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         """Check if a path is an x402-gated route."""
         if path in self.PAID_PATHS:
             return True
-        if path.startswith("/signal/") and path != "/signal/":
+        if path.startswith("/signal/") and path != "/signal/" and not path.endswith("/trace"):
             return True
         return False
 
@@ -750,6 +814,7 @@ async def root():
             "/analytics": "API usage analytics — who's using us, request trends",
             "/analytics/x402": "x402 payment analytics — paid calls, revenue, conversion rate",
             "/analytics/insights": "Growth insights — external vs internal, AI agent trends, revenue split",
+            "/analytics/ic": "Signal quality — Information Coefficient per scoring dimension per regime",
             "/api/history": "Paginated history of all agent runs",
         },
         "discovery": {
@@ -936,6 +1001,180 @@ async def get_asset_signal(asset: str):
             "risk_level": portfolio.get("risk_level"),
             "signal_momentum": portfolio.get("signal_momentum"),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /signal/{asset}/trace — Pipeline trace for debugging & transparency
+# ---------------------------------------------------------------------------
+@app.get("/signal/{asset}/trace", tags=["signals"])
+async def get_signal_trace(asset: str):
+    """Full pipeline trace showing how an asset's score was computed step-by-step.
+
+    Shows: raw agent data → dimension scores → regime → weights → composite →
+    velocity dampening → abstain check → final label.
+    Free endpoint — intended for debugging and transparency.
+    """
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    asset = asset.upper()
+
+    # Load the latest fusion result
+    fusion_data = _store.load("signal_fusion")
+    if not fusion_data:
+        raise HTTPException(status_code=503, detail="No fusion data available yet")
+
+    signals = fusion_data.get("signals", {})
+    if asset not in signals:
+        valid = list(signals.keys())
+        raise HTTPException(
+            status_code=404,
+            detail=f"Asset '{asset}' not found. Valid: {valid}",
+        )
+
+    sig = signals[asset]
+    portfolio = fusion_data.get("portfolio_summary", {})
+
+    # Gather raw agent inputs for this asset
+    agent_names = {
+        "whale": "whale_agent",
+        "technical": "technical_agent",
+        "derivatives": "derivatives_agent",
+        "narrative": "narrative_agent",
+        "market": "market_agent",
+    }
+    raw_inputs: dict = {}
+    for role, agent_name in agent_names.items():
+        snapshot = _store.load_latest(agent_name)
+        if snapshot and "data" in snapshot:
+            data = snapshot["data"]
+            # Find this asset's data in the agent output
+            asset_data = data.get(asset, data.get(asset.lower()))
+            if asset_data and isinstance(asset_data, dict):
+                # Extract key metrics (not the full blob)
+                raw_inputs[role] = {
+                    k: v for k, v in asset_data.items()
+                    if not isinstance(v, (list, dict)) or k in ("llm_events",)
+                }
+            else:
+                raw_inputs[role] = None
+        else:
+            raw_inputs[role] = None
+
+    # Build step-by-step trace
+    dims = sig.get("dimensions", {})
+    trace_steps = []
+
+    # Step 1: Raw data summary
+    trace_steps.append({
+        "step": 1,
+        "name": "Raw Agent Data",
+        "description": "Key metrics from each data collection agent",
+        "data": raw_inputs,
+    })
+
+    # Step 2: Dimension scores
+    dim_scores = {}
+    for dim, info in dims.items():
+        dim_scores[dim] = {
+            "score": info.get("score"),
+            "detail": info.get("detail"),
+            "data_tier": info.get("data_tier"),
+        }
+    trace_steps.append({
+        "step": 2,
+        "name": "Dimension Scores",
+        "description": "Each dimension scored 0-100 based on its rules",
+        "data": dim_scores,
+    })
+
+    # Step 3: Regime detection
+    trace_steps.append({
+        "step": 3,
+        "name": "Regime Detection",
+        "description": "Current market regime determines scoring behavior",
+        "data": {
+            "regime": sig.get("regime"),
+            "regime_at_generation": sig.get("regime_at_generation"),
+            "fear_greed": portfolio.get("fear_greed"),
+            "btc_downtrend": sig.get("trend_dampened"),
+        },
+    })
+
+    # Step 4: Weights
+    dim_weights = {}
+    for dim, info in dims.items():
+        dim_weights[dim] = info.get("weight")
+    trace_steps.append({
+        "step": 4,
+        "name": "Adjusted Weights",
+        "description": "Weights after regime adjustments, data quality rebalancing, and IC optimization",
+        "data": dim_weights,
+    })
+
+    # Step 5: Composite
+    trace_steps.append({
+        "step": 5,
+        "name": "Composite Score",
+        "description": "Weighted sum of dimension scores",
+        "data": {
+            "composite": sig.get("composite_score"),
+            "formula": " + ".join(
+                f"{dim}({dims[dim].get('score', '?')}) x {dims[dim].get('weight', '?')}"
+                for dim in dims
+            ),
+        },
+    })
+
+    # Step 6: Velocity dampening
+    vel = sig.get("velocity")
+    trace_steps.append({
+        "step": 6,
+        "name": "Velocity Dampening",
+        "description": "Dampens composite when indicators accelerate against signal",
+        "data": {
+            "applied": vel is not None and vel.get("dampening_factor", 1.0) < 1.0,
+            "dampening_factor": vel.get("dampening_factor") if vel else 1.0,
+            "velocity_details": vel if vel else "not applied",
+        },
+    })
+
+    # Step 7: Abstain check
+    abstain_threshold = sig.get("abstain_threshold", 0)
+    composite = sig.get("composite_score", 50)
+    distance = abs(composite - 50.0)
+    trace_steps.append({
+        "step": 7,
+        "name": "Abstain Check",
+        "description": f"|{composite} - 50| = {distance:.1f} {'<' if sig.get('abstain') else '>='} {abstain_threshold}",
+        "data": {
+            "composite": composite,
+            "distance_from_center": round(distance, 1),
+            "abstain_threshold": abstain_threshold,
+            "abstain": sig.get("abstain"),
+        },
+    })
+
+    # Step 8: Final output
+    trace_steps.append({
+        "step": 8,
+        "name": "Final Signal",
+        "description": "The output signal after all processing",
+        "data": {
+            "label": sig.get("label"),
+            "direction": sig.get("direction"),
+            "composite_score": composite,
+            "momentum": sig.get("momentum"),
+            "prev_score": sig.get("prev_score"),
+            "config_version": sig.get("config_version"),
+        },
+    })
+
+    return {
+        "asset": asset,
+        "timestamp": fusion_data.get("meta", {}).get("timestamp"),
+        "trace": trace_steps,
     }
 
 
@@ -1236,6 +1475,147 @@ async def get_analytics_insights(
         },
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/ic — Information Coefficient per dimension per regime
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/ic", tags=["analytics"])
+async def get_ic_analytics(
+    window_hours: int = Query(24, ge=24, le=168, description="Evaluation window (24, 48, 168)"),
+    days: int = Query(30, ge=7, le=90, description="Lookback period in days"),
+):
+    """Signal quality — Information Coefficient (Spearman rank correlation) per scoring dimension.
+
+    IC measures how well each dimension's scores predict actual future returns.
+    Tracked per dimension, per regime, with ICIR (consistency) metric.
+
+    IC interpretation:
+      0.05-0.10 = useful signal
+      > 0.10 = strong signal
+      < 0 = anti-predictive (signal is backwards)
+      ICIR > 0.5 = consistent signal quality
+    """
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    ic_data = _store.compute_ic(window_hours=window_hours, days=days)
+
+    # Add health status per dimension
+    dimensions = ic_data.get("dimensions", {})
+    for dim, stats in dimensions.items():
+        ic = stats.get("ic")
+        if ic is None:
+            stats["status"] = "no_data"
+        elif ic >= 0.07:
+            stats["status"] = "strong"
+        elif ic >= 0.03:
+            stats["status"] = "active"
+        elif ic >= 0.0:
+            stats["status"] = "watch"
+        else:
+            stats["status"] = "weak"
+
+    return {
+        "window_hours": window_hours,
+        "lookback_days": days,
+        "overall_ic": ic_data.get("overall_ic"),
+        "total_observations": ic_data.get("total_observations", 0),
+        "total_slices": ic_data.get("total_slices", 0),
+        "dimensions": dimensions,
+        "by_regime": ic_data.get("by_regime", {}),
+        "interpretation": {
+            "ic_useful": "IC > 0.03 indicates predictive value",
+            "ic_strong": "IC > 0.07 indicates strong predictive signal",
+            "icir": "ICIR = mean(IC)/std(IC) — measures consistency. ICIR > 0.5 is good.",
+            "slices": "Each slice is a cross-asset snapshot (need 3+ assets for valid IC)",
+        },
+        "last_computed": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/signal-health — Tournament dashboard data
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/signal-health", tags=["analytics"])
+async def get_signal_health():
+    """Signal health dashboard — IC per dimension, weights, decay alerts,
+    optimizer change log, regime info, and abstain rate.
+    Aggregates all scoring pipeline metrics in one call for the dashboard.
+    """
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    result: dict = {}
+
+    # 1. IC per dimension (24h and 48h windows)
+    for wh in [24, 48]:
+        cached = _store.load_kv_json("ic_tracking", f"ic_{wh}h_30d")
+        if cached:
+            dims = cached.get("dimensions", {})
+            for dim, stats in dims.items():
+                ic = stats.get("ic")
+                if ic is None:
+                    stats["status"] = "no_data"
+                elif ic >= 0.07:
+                    stats["status"] = "strong"
+                elif ic >= 0.03:
+                    stats["status"] = "active"
+                elif ic >= 0.0:
+                    stats["status"] = "watch"
+                else:
+                    stats["status"] = "weak"
+            result[f"ic_{wh}h"] = cached
+        else:
+            result[f"ic_{wh}h"] = None
+
+    # 2. Current weights (from optimizer)
+    learned = _store.load_kv_json("weight_optimizer", "learned_weights")
+    result["weights"] = learned
+
+    # 3. Optimizer state
+    opt_state = _store.load_kv_json("weight_optimizer", "optimizer_state")
+    result["optimizer_state"] = opt_state
+
+    # 4. Decay alerts
+    decay = _store.load_kv_json("weight_optimizer", "decay_alerts")
+    result["decay_alerts"] = decay
+
+    # 5. Change log (last 10 entries)
+    change_log = _store.load_kv_json("weight_optimizer", "change_log") or []
+    result["change_log"] = change_log[-10:]
+
+    # 6. Config version (from latest fusion result)
+    latest_fusion = _store.load("signal_fusion")
+    if latest_fusion:
+        meta = latest_fusion.get("meta", {})
+        result["config_version"] = meta.get("config_version")
+        result["regime"] = latest_fusion.get("regime")
+        # Count abstain rate
+        signals = latest_fusion.get("signals", {})
+        total = len(signals)
+        abstain = sum(1 for s in signals.values()
+                      if isinstance(s, dict) and s.get("label") == "ABSTAIN")
+        result["abstain_rate"] = round(abstain / total * 100, 1) if total else 0
+        result["total_assets"] = total
+        result["abstain_count"] = abstain
+    else:
+        result["config_version"] = None
+        result["regime"] = None
+        result["abstain_rate"] = 0
+
+    # 7. Agent cadences
+    result["agent_cadences"] = {
+        "technical_agent": int(os.getenv("AGENT_CADENCE_TECHNICAL_MIN", "15")),
+        "derivatives_agent": int(os.getenv("AGENT_CADENCE_DERIVATIVES_MIN", "15")),
+        "whale_agent": int(os.getenv("AGENT_CADENCE_WHALE_MIN", "30")),
+        "market_agent": int(os.getenv("AGENT_CADENCE_MARKET_MIN", "30")),
+        "narrative_agent": int(os.getenv("AGENT_CADENCE_NARRATIVE_MIN", "60")),
+    }
+
+    return result
 
 
 # ---------------------------------------------------------------------------

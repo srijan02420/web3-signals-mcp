@@ -243,10 +243,115 @@ sentiment:
 llm_sentiment:
   enabled: true
   model: "claude-haiku-4-5-20251001"
-  max_tokens: 2048
-  max_age_hours: 24                  # discard LLM results older than 24h
+  max_tokens: 2048                   # reduced from 4096 — sufficient for event extraction
+  max_age_hours: 48                  # increased from 24h — events remain valid longer
   system_prompt: >
-    You are a crypto market sentiment analyst. Analyze headlines for each
-    cryptocurrency and provide structured sentiment analysis. Focus on
-    identifying dominant narratives, sentiment direction, and confidence.
-    Consider what builders, investors, and traders are saying separately.
+    You are a crypto market event analyst. Analyze headlines for each
+    cryptocurrency. Extract both overall sentiment AND specific material
+    events (regulatory rulings, hacks, partnerships, listings, protocol
+    upgrades, institutional adoption). One SEC ruling matters more than
+    1000 generic price analysis articles. Focus on events that PRECEDE
+    price moves, not articles that react to them.
+
+  # Event types the LLM should classify headlines into
+  event_types:
+    - regulatory        # SEC filings, ETF approvals/rejections, bans, legal rulings
+    - hack_exploit      # security breaches, rug pulls, exploits, fund recoveries
+    - partnership       # integrations, collaborations, ecosystem deals
+    - listing           # exchange listings, delistings, trading pair additions
+    - upgrade           # protocol upgrades, hard forks, major releases
+    - adoption          # institutional buys, corporate treasury, payment integrations
+    - market_event      # whale moves, liquidation cascades, market structure shifts
+    - general_sentiment # generic bullish/bearish commentary (lowest priority)
+
+  # Pre-filter: score headlines by news-worthiness BEFORE sending to LLM.
+  # Saves tokens, reduces noise, and ensures material events aren't drowned out.
+  headline_filter:
+    enabled: true
+    max_per_asset: 5               # max headlines per asset sent to LLM (reduced from 10)
+    min_relevance_score: -3.0      # drop headlines below this score
+
+    # Headlines containing these keywords get boosted (+2 each)
+    boost_keywords:
+      # Regulatory
+      - sec
+      - etf
+      - regulat
+      - ruling
+      - lawsuit
+      - ban
+      - approv
+      - reject
+      - compliance
+      - legal
+      - court
+      - enforce
+      # Hacks / exploits
+      - hack
+      - exploit
+      - breach
+      - rug
+      - scam
+      - theft
+      - vulnerab
+      - recover
+      # Partnerships / adoption
+      - partnership
+      - integrat
+      - adopt
+      - treasury
+      - institutional
+      - blackrock
+      - fidelity
+      - grayscale
+      - jpmorgan
+      - goldman
+      # Listings
+      - listing
+      - delist
+      - launch
+      - exchange
+      # Upgrades
+      - upgrade
+      - fork
+      - mainnet
+      - testnet
+      - release
+      - deploy
+      # Market structure
+      - liquidat
+      - whale
+      - billion
+      - million
+      - record
+      - all-time
+      - inflow
+      - outflow
+
+    # Headlines matching these patterns get penalized (-5 each)
+    noise_patterns:
+      - should i
+      - what do you think
+      - is it too late
+      - price prediction
+      - price analysis
+      - will it
+      - can it reach
+      - when will
+      - daily discussion
+      - daily thread
+      - unpopular opinion
+      - change my mind
+      - eli5
+      - beginner
+      - newbie
+      - help me
+      - advice needed
+      - thoughts on
+      - opinions on
+
+    # Structural penalties
+    question_penalty: -3.0         # headlines ending with "?" are usually discussion
+    short_headline_penalty: -2.0   # headlines < 20 chars are usually low quality
+    short_headline_threshold: 20
+    number_bonus: 1.0              # headlines with numbers = specific data = better

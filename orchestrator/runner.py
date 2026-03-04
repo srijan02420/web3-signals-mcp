@@ -23,6 +23,30 @@ from typing import Any, Dict, List
 
 from shared.storage import Storage
 
+# Per-agent cadence (minutes). Agents whose cadence hasn't elapsed are skipped.
+# Override via env: AGENT_CADENCE_TECHNICAL_MIN=15, AGENT_CADENCE_WHALE_MIN=30, etc.
+_AGENT_CADENCES_MIN: Dict[str, int] = {
+    "technical_agent":   15,   # Price action is fast
+    "derivatives_agent": 15,   # Lead indicators need frequent sampling
+    "whale_agent":       30,   # Whale moves are sporadic
+    "market_agent":      30,   # F&G daily, dominance slow
+    "narrative_agent":   60,   # Reddit/news don't change every 15min
+}
+
+_agent_last_run: Dict[str, float] = {}
+
+
+def _should_run_agent(name: str, force: bool = False) -> bool:
+    """Check if enough time has elapsed since this agent's last run."""
+    if force:
+        return True
+    env_key = f"AGENT_CADENCE_{name.upper().replace('_AGENT', '')}_MIN"
+    cadence_min = int(os.getenv(env_key, str(_AGENT_CADENCES_MIN.get(name, 15))))
+    last = _agent_last_run.get(name)
+    if last is None:
+        return True
+    return (time.time() - last) >= cadence_min * 60
+
 
 def _run_agent(name: str, factory, store: Storage) -> Dict[str, Any]:
     """Run a single agent, save result, return summary."""
@@ -31,6 +55,7 @@ def _run_agent(name: str, factory, store: Storage) -> Dict[str, Any]:
         agent = factory()
         result = agent.execute()
         store.save(name, result)
+        _agent_last_run[name] = time.time()
         elapsed = time.time() - start
         return {
             "agent": name,
@@ -48,8 +73,12 @@ def _run_agent(name: str, factory, store: Storage) -> Dict[str, Any]:
         }
 
 
-def run_all_agents(store: Storage) -> List[Dict[str, Any]]:
-    """Run all data collection agents and return summaries."""
+def run_all_agents(store: Storage, force: bool = False) -> List[Dict[str, Any]]:
+    """Run all data collection agents and return summaries.
+
+    Args:
+        force: If True, ignore cadence and run all agents (used for --once).
+    """
     results: List[Dict[str, Any]] = []
 
     # Import agents here to avoid import errors if one agent's deps are missing
@@ -86,6 +115,10 @@ def run_all_agents(store: Storage) -> List[Dict[str, Any]]:
         results.append({"agent": "whale_agent", "status": "import_error", "duration_sec": 0, "errors": [str(e)]})
 
     for name, factory in agents:
+        if not _should_run_agent(name, force=force):
+            cadence = _AGENT_CADENCES_MIN.get(name, 15)
+            print(f"  [{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {name}: SKIP (cadence {cadence}min)")
+            continue
         print(f"  [{datetime.now(timezone.utc).strftime('%H:%M:%S')}] Running {name}...")
         summary = _run_agent(name, factory, store)
         status_icon = "OK" if summary["status"] == "success" else "PARTIAL" if summary["status"] == "partial" else "ERR"
@@ -129,9 +162,10 @@ def main():
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         print(f"=== Run #{run_count} at {ts} ===")
 
-        # Run all agents
+        # Run all agents (force=True on first run or --once to ignore cadence)
         total_start = time.time()
-        agent_results = run_all_agents(store)
+        force = args.once or run_count == 1
+        agent_results = run_all_agents(store, force=force)
         total_agent_time = time.time() - total_start
 
         # Run fusion

@@ -165,6 +165,79 @@ regime_weighting:
     market: 1.3         # boost contrarian market
 
 # ---------------------------------------------------------------------------
+# Fear & Greed Regime-First Scoring — THE FIX for the abstain problem
+# ---------------------------------------------------------------------------
+# Problem: 4 contrarian dimensions say "BUY" in fear markets while 2 pro-trend
+#          dimensions say "SELL" → they cancel out → composite ~50 → ABSTAIN.
+# Solution: Let the F&G regime determine the scoring philosophy.
+#   - In fear: BOOST pro-trend dims, SUPPRESS contrarian dims, dampen
+#     contrarian scores above 50 toward neutral.
+#   - In greed: BOOST contrarian dims (their edge is proven in greed).
+#
+# Applied AFTER accuracy scaling + trending/ranging shifts. Weight shifts are
+# multipliers (>1.0 = boost, <1.0 = suppress). Score dampening pulls above-50
+# scores toward 50, reducing false contrarian "buy" signals in fear markets.
+# ---------------------------------------------------------------------------
+fg_regime_scoring:
+  enabled: true
+
+  extreme_fear:                         # F&G 0-20
+    weight_shifts:
+      whale: 0.1                        # 27% bullish accuracy = noise
+      technical: 0.3                    # stop buying every dip
+      derivatives: 0.5                  # shorts stay overcrowded in crashes
+      narrative: 0.2                    # silence ≠ opportunity in crashes
+      market: 1.5                       # boost but less (global signal, low differentiation)
+      trend: 4.0                        # trend-following differentiates assets most
+    abstain_distance: 5                 # tight: extreme conditions have more edge
+    score_dampening:
+      enabled: true
+      factor: 0.4                       # keep 40% of distance above 50
+      dimensions: [whale, technical, derivatives, narrative]
+
+  fear:                                 # F&G 20-40
+    weight_shifts:
+      whale: 0.4
+      technical: 0.6
+      derivatives: 0.8
+      narrative: 0.4
+      market: 1.8
+      trend: 2.0
+    abstain_distance: 8
+    score_dampening:
+      enabled: true
+      factor: 0.6
+      dimensions: [whale, technical, narrative]
+
+  neutral:                              # F&G 40-60
+    weight_shifts: {}                   # no changes — balanced mode
+    abstain_distance: 12
+
+  greed:                                # F&G 60-80
+    weight_shifts:
+      whale: 1.3                        # 61% bearish accuracy = trust it
+      technical: 1.2                    # overbought signals work here
+      derivatives: 1.1
+      narrative: 1.3                    # buzz = sell signal works in greed
+      market: 0.6
+      trend: 0.5
+    abstain_distance: 8
+
+  extreme_greed:                        # F&G 80-100
+    weight_shifts:
+      whale: 1.5
+      technical: 1.4
+      derivatives: 1.2
+      narrative: 1.5
+      market: 0.4                       # pro-trend is dangerous at tops
+      trend: 0.3
+    abstain_distance: 6
+    score_dampening:
+      enabled: true
+      factor: 0.5
+      dimensions: [market, trend]       # dampen "keep buying" signals
+
+# ---------------------------------------------------------------------------
 # Asset tier system — different scoring profiles for different asset classes
 # ---------------------------------------------------------------------------
 # Research (Baur 2018, Corbet 2019): BTC/ETH exhibit momentum, small-caps
@@ -375,6 +448,26 @@ scoring:
     combo_overcrowded_high_funding_penalty: -15  # crash risk combo
     combo_contrarian_negative_funding_bonus: 10  # squeeze setup combo
 
+    # --- LEAD INDICATOR: Funding rate CHANGE (delta) ---
+    # The REVERSAL of funding is the signal, not the absolute level.
+    # Funding rate falling (becoming more negative) = squeeze pressure building = bullish
+    # Funding rate rising (becoming more positive) = longs paying more = bearish
+    # Source: computed from derivatives_agent historical snapshots (zero new API)
+    funding_rate_change:
+      enabled: true
+      threshold: 0.00005          # minimum absolute change to be considered significant
+      max_points: 8               # max points added/subtracted
+
+    # --- LEAD INDICATOR: OI-price divergence ---
+    # OI rising + price flat = conviction building without price following = breakout imminent
+    # OI falling + price rising = weak rally without conviction = bearish
+    # Source: OI from derivatives_agent, price from market_agent (zero new API)
+    oi_price_divergence:
+      enabled: true
+      oi_threshold_pct: 3.0       # OI must change more than 3% to count
+      price_threshold_pct: 2.0    # price must be within 2% to count as "flat"
+      max_points: 10              # max points for divergence signal
+
   # -----------------------------------------------------------------------
   # NARRATIVE scoring (per asset) — CONTRARIAN 6-component scoring
   # -----------------------------------------------------------------------
@@ -417,6 +510,32 @@ scoring:
     # Component 6: Multi-source confirmation (reduced)
     multi_source_bonus: 5
     multi_source_threshold: 3        # need >= N sources with data
+
+    # --- Component 7: LLM Event scoring ---
+    # Material events from LLM headline classification.
+    # One ETF approval matters more than 1000 Reddit mentions.
+    # Events are scored by type (regulatory > hack > adoption > partnership)
+    # and magnitude (critical > high > medium > low), capped at max_points.
+    event_scoring:
+      enabled: true
+      max_points: 20                   # total cap from events (±20 from composite)
+      max_events_scored: 3             # only score top N events by magnitude
+      # Points per event type (before magnitude multiplier)
+      type_weights:
+        regulatory: 15                 # SEC rulings, ETF decisions
+        hack_exploit: 18               # hacks/exploits (always bearish, high impact)
+        adoption: 12                   # institutional buys, corporate treasury
+        listing: 10                    # exchange listings
+        partnership: 8                 # integrations, collaborations
+        upgrade: 6                     # protocol upgrades
+        market_event: 5                # whale moves, liquidations
+        general_sentiment: 2           # generic commentary (low signal)
+      # Magnitude scaling
+      magnitude_multipliers:
+        critical: 1.5
+        high: 1.0
+        medium: 0.6
+        low: 0.3
 
     # Cap
     max_score: 100
@@ -622,54 +741,6 @@ reweighting:
 
 # ---------------------------------------------------------------------------
 # Conviction multiplier — amplify composite when dimensions agree
-# ---------------------------------------------------------------------------
-# When N+ dimensions independently agree on a direction, boost the composite
-# score away from 50. This breaks the "everything is neutral" clustering
-# problem and generates more actionable signals.
-#
-# Example: composite=56, 3 dimensions bullish → 56 + (56-50)*0.25 = 57.5
-# Example: composite=42, 3 dimensions bearish → 42 - (50-42)*0.25 = 40.0
-conviction:
-  enabled: false                  # DISABLED — proven harmful (boosted=36.9% vs unboosted=49.7%)
-  min_agreeing_dimensions: 3
-  boost_factor: 1.25
-
-# ---------------------------------------------------------------------------
-# Confidence scoring — multi-factor quality gate
-# ---------------------------------------------------------------------------
-# Computed AFTER composite. If confidence is below threshold, force
-# INSUFFICIENT EDGE regardless of composite score.
-#
-# This supplements (and simplifies) the abstain mechanism:
-#   Abstain catches "close to 50" signals (pure noise).
-#   Confidence catches "far from 50 but unreliable" signals.
-# ---------------------------------------------------------------------------
-confidence:
-  enabled: false           # disabled — abstain zone is sufficient quality gate
-  threshold: 65
-
-  # Factor weights (must sum to 1.0)
-  factors:
-    # How many dimensions agree on direction (above/below 50)
-    # 6/6 agree = 100, 5/6 = 80, 4/6 = 60, 3/6 = 40, etc.
-    dimension_agreement:
-      weight: 0.35
-
-    # Distance of composite from 50 (stronger signal = higher confidence)
-    signal_strength:
-      weight: 0.25
-      max_distance: 20       # distance at which this factor maxes out at 100
-
-    # Data quality: how many dimensions have full data tier
-    data_quality:
-      weight: 0.25
-
-    # Velocity confirmation: is indicator momentum aligned with signal?
-    velocity_alignment:
-      weight: 0.15
-      aligned_above: 0.8     # velocity dampening >= 0.8 = fully aligned
-      opposed_below: 0.5     # velocity dampening < 0.5 = signal opposed
-
 # ---------------------------------------------------------------------------
 # Abstain — suppress low-confidence signals
 # ---------------------------------------------------------------------------
@@ -897,7 +968,9 @@ accuracy:
 # LLM insights (Claude Haiku)
 # ---------------------------------------------------------------------------
 llm_insights:
-  enabled: true
+  enabled: false               # DISABLED — costs ~$0.65/day but doesn't enhance scores.
+                                # These generate decorative text summaries only.
+                                # Re-enable if you want LLM-written insights on dashboard.
 
   # Model to use
   model: "claude-haiku-4-5-20251001"
@@ -923,22 +996,38 @@ llm_insights:
   portfolio_summary: true
 
 # ---------------------------------------------------------------------------
-# Self-learning weight optimizer
+# Self-learning weight optimizer (IC-based)
 # ---------------------------------------------------------------------------
-# Automatically adjusts dimension weights based on rolling per-dimension
-# accuracy. Better-performing dimensions get higher weights.
-# Uses EMA blending to prevent oscillation.
+# Phase 2: Uses Information Coefficient (Spearman rank correlation) to adjust
+# dimension weights. Falls back to accuracy-proportional if IC data unavailable.
+#
+# Auto-promote: IC > ic_promote_threshold → boost weight × promote_boost
+# Auto-demote:  IC < ic_demote_threshold  → reduce weight × demote_factor
+# Auto-disable: IC < ic_disable_threshold → minimize weight × disable_factor
+# Decay alert:  IC drops >50% from previous → log warning
 learning:
   enabled: true
   optimize_every_n_evals: 8      # run after this many new evaluations
-  lookback_days: 7               # use accuracy data from this many days
-  min_evaluations: 20            # don't optimize until this many evals exist
+  min_evaluations: 20            # don't optimize until this many evals exist (accuracy fallback)
+  min_ic_slices: 10              # don't use IC until this many cross-asset slices exist
   min_weight: 0.05               # no dimension below 5%
   max_weight: 0.40               # no dimension above 40%
   learning_rate: 0.3             # EMA: 30% new weights + 70% old weights
-  method: "accuracy_proportional"
   state_namespace: "learning_optimizer"
-  fallback_weights:              # used before first optimization
+
+  # IC-based promote/demote thresholds
+  ic_promote_threshold: 0.03     # IC above this = signal is working → boost
+  ic_demote_threshold: 0.01      # IC below this = signal is weak → reduce
+  ic_disable_threshold: -0.02    # IC below this = signal is harmful → minimize
+  promote_boost: 1.3             # multiplier for strong dimensions
+  demote_factor: 0.5             # multiplier for weak dimensions
+  disable_factor: 0.15           # multiplier for negative-IC dimensions
+
+  # Decay detection
+  decay_threshold_pct: 50        # alert if IC drops >50% from previous run
+
+  # Fallback weights (used before first optimization or when IC unavailable)
+  fallback_weights:
     whale: 0.17
     technical: 0.25
     derivatives: 0.21
@@ -946,30 +1035,3 @@ learning:
     market: 0.13
     trend: 0.15
 
-# ---------------------------------------------------------------------------
-# Delta (change-detection) scoring
-# ---------------------------------------------------------------------------
-# Scores CHANGES in dimension values. A rapid improvement in whale activity
-# is more predictive than a static high whale score. Blended with absolute
-# composite: final = absolute * absolute_weight + delta * delta_weight.
-delta_scoring:
-  enabled: false                 # DISABLED (Phase 5): At 15-min intervals, dimension scores barely change.
-                                 # Delta composite ≈ 50 (neutral) ~95% of the time.
-                                 # Even at 15% weight, this systematically drags all scores toward 50,
-                                 # compressing the range by ~2-3 points. Combined with recentered scoring,
-                                 # disabling delta gives the absolute composite room to express real signals.
-                                 # Re-enable if orchestrator interval increases to 4h+.
-  delta_weight: 0.15
-  absolute_weight: 0.85
-  thresholds:
-    whale:       { significant: 15, major: 25 }
-    technical:   { significant: 12, major: 20 }
-    derivatives: { significant: 10, major: 18 }
-    narrative:   { significant: 15, major: 25 }
-    market:      { significant: 10, major: 18 }
-    trend:       { significant: 12, major: 20 }
-  improving_significant_bonus: 10
-  improving_major_bonus: 20
-  degrading_significant_penalty: -10
-  degrading_major_penalty: -20
-  reversal_bonus: 15

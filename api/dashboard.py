@@ -609,6 +609,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="tab" data-view="table" onclick="switchView('table', this)">Table</button>
     <button class="tab" data-view="performance" onclick="switchView('performance', this)">Performance</button>
     <button class="tab" data-view="analytics" onclick="switchView('analytics', this)">Analytics</button>
+    <button class="tab" data-view="signal-health" onclick="switchView('signal-health', this)">Signal Health</button>
     <button class="tab" data-view="history" onclick="switchView('history', this)">History</button>
   </div>
 
@@ -911,9 +912,239 @@ function switchView(view, btn) {
     renderPerformance();
   } else if (view === 'analytics') {
     renderAnalytics();
+  } else if (view === 'signal-health') {
+    loadSignalHealth();
   } else {
     renderSignals();
   }
+}
+
+// ===== SIGNAL HEALTH VIEW =====
+let healthData = null;
+
+async function loadSignalHealth() {
+  document.getElementById('content').innerHTML = '<div class="loading"><div class="spinner"></div><span style="color:var(--text-dim)">Loading signal health...</span></div>';
+  try {
+    const res = await fetch(`${API_BASE}/analytics/signal-health`);
+    healthData = await res.json();
+    renderSignalHealth();
+  } catch(e) {
+    document.getElementById('content').innerHTML = '<div class="loading"><span style="color:var(--red)">Failed to load signal health</span></div>';
+  }
+}
+
+function renderSignalHealth() {
+  if (!healthData) return;
+  const d = healthData;
+
+  // Header cards
+  const regime = d.regime || {};
+  const regimeName = regime.label || regime.name || 'Unknown';
+  const fgVal = regime.fear_greed_value || regime.value || '?';
+  const configShort = d.config_version ? d.config_version.substring(0, 8) : 'n/a';
+  const abstainPct = d.abstain_rate || 0;
+  const abstainColor = abstainPct > 60 ? 'var(--red)' : abstainPct > 40 ? 'var(--yellow)' : 'var(--green)';
+
+  let html = `
+    <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(180px,1fr)); gap:12px; margin-bottom:24px;">
+      <div class="portfolio-card">
+        <div class="label">Regime</div>
+        <div class="value" style="color:${fgVal<25?'var(--red)':fgVal<45?'var(--yellow)':fgVal<60?'var(--text)':'var(--green)'}">${regimeName}</div>
+        <div class="sub">F&G: ${fgVal}</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="label">Config Version</div>
+        <div class="value" style="font-size:16px; font-family:monospace;">${configShort}</div>
+        <div class="sub">scoring profile hash</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="label">Abstain Rate</div>
+        <div class="value" style="color:${abstainColor}">${abstainPct}%</div>
+        <div class="sub">${d.abstain_count || 0} / ${d.total_assets || 0} assets</div>
+      </div>
+      <div class="portfolio-card">
+        <div class="label">Optimizer</div>
+        <div class="value" style="font-size:16px;">${d.optimizer_state ? 'Active' : 'Waiting'}</div>
+        <div class="sub">${d.optimizer_state ? 'runs: ' + (d.optimizer_state.total_optimizations || 0) : 'needs IC data'}</div>
+      </div>
+    </div>`;
+
+  // Dimension IC table
+  const ic24 = d.ic_24h;
+  const ic48 = d.ic_48h;
+  const dims24 = ic24 ? ic24.dimensions || {} : {};
+  const dims48 = ic48 ? ic48.dimensions || {} : {};
+  const allDims = [...new Set([...Object.keys(dims24), ...Object.keys(dims48)])].sort();
+
+  // Current weights
+  const wts = d.weights || {};
+  const currentWeights = wts.weights || {};
+  const weightReasons = wts.reasons || {};
+
+  const statusIcon = (s) => {
+    if (s === 'strong') return '<span style="color:var(--green)">&#9679; strong</span>';
+    if (s === 'active') return '<span style="color:var(--blue)">&#9679; active</span>';
+    if (s === 'watch') return '<span style="color:var(--yellow)">&#9679; watch</span>';
+    if (s === 'weak') return '<span style="color:var(--red)">&#9679; weak</span>';
+    return '<span style="color:var(--text-dim)">&#9675; no data</span>';
+  };
+
+  const fmtIC = (v) => {
+    if (v === null || v === undefined) return '<span style="color:var(--text-dim)">—</span>';
+    const color = v >= 0.07 ? 'var(--green)' : v >= 0.03 ? 'var(--blue)' : v >= 0 ? 'var(--yellow)' : 'var(--red)';
+    return `<span style="color:${color}; font-weight:600">${v.toFixed(4)}</span>`;
+  };
+
+  html += `
+    <div style="background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:24px;">
+      <h3 style="font-size:15px; margin-bottom:16px;">Dimension Health</h3>
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);">
+            <th style="text-align:left; padding:8px 12px; color:var(--text-dim);">Dimension</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">24h IC</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">48h IC</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">ICIR</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">Status</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">Weight</th>
+            <th style="text-align:left; padding:8px 12px; color:var(--text-dim);">Action</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+  for (const dim of allDims) {
+    const d24 = dims24[dim] || {};
+    const d48 = dims48[dim] || {};
+    const ic24v = d24.ic;
+    const ic48v = d48.ic;
+    const icir = d24.icir;
+    const status = d24.status || d48.status || 'no_data';
+    const wt = currentWeights[dim];
+    const reason = weightReasons[dim] || '';
+
+    html += `
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:10px 12px; font-weight:600;">${dim.replace('_', ' ')}</td>
+            <td style="text-align:center; padding:10px 12px;">${fmtIC(ic24v)}</td>
+            <td style="text-align:center; padding:10px 12px;">${fmtIC(ic48v)}</td>
+            <td style="text-align:center; padding:10px 12px;">${icir != null ? icir.toFixed(2) : '—'}</td>
+            <td style="text-align:center; padding:10px 12px;">${statusIcon(status)}</td>
+            <td style="text-align:center; padding:10px 12px; font-weight:600;">${wt != null ? (wt * 100).toFixed(0) + '%' : '—'}</td>
+            <td style="padding:10px 12px; color:var(--text-dim); font-size:12px;">${reason}</td>
+          </tr>`;
+  }
+
+  // If no dimensions, show placeholder
+  if (!allDims.length) {
+    html += `<tr><td colspan="7" style="padding:20px; text-align:center; color:var(--text-dim);">
+      No IC data yet. Needs 24h+ of scored signals to compute.
+    </td></tr>`;
+  }
+
+  html += `</tbody></table>
+      <div style="margin-top:12px; font-size:11px; color:var(--text-dim);">
+        IC = Spearman rank correlation between dimension scores and future returns.
+        Observations: ${ic24 ? ic24.total_observations || 0 : 0} (24h), ${ic48 ? ic48.total_observations || 0 : 0} (48h)
+      </div>
+    </div>`;
+
+  // Regime Performance (if by_regime data exists)
+  const byRegime = ic24 ? ic24.by_regime || {} : {};
+  const regimeKeys = Object.keys(byRegime);
+  if (regimeKeys.length) {
+    html += `
+    <div style="background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:24px;">
+      <h3 style="font-size:15px; margin-bottom:16px;">Performance by Regime</h3>
+      <table style="width:100%; border-collapse:collapse; font-size:13px;">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);">
+            <th style="text-align:left; padding:8px 12px; color:var(--text-dim);">Regime</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">IC</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">Observations</th>
+            <th style="text-align:center; padding:8px 12px; color:var(--text-dim);">Slices</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+    for (const rk of regimeKeys) {
+      const rv = byRegime[rk];
+      html += `
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:10px 12px; font-weight:600;">${rk}</td>
+            <td style="text-align:center; padding:10px 12px;">${fmtIC(rv.ic)}</td>
+            <td style="text-align:center; padding:10px 12px;">${rv.observations || 0}</td>
+            <td style="text-align:center; padding:10px 12px;">${rv.slices || 0}</td>
+          </tr>`;
+    }
+
+    html += `</tbody></table></div>`;
+  }
+
+  // Decay Alerts
+  const decayAlerts = d.decay_alerts;
+  if (decayAlerts && decayAlerts.alerts && decayAlerts.alerts.length) {
+    html += `
+    <div style="background:var(--surface); border:1px solid rgba(239,68,68,0.3); border-radius:10px; padding:20px; margin-bottom:24px;">
+      <h3 style="font-size:15px; margin-bottom:12px; color:var(--red);">Decay Alerts</h3>`;
+    for (const a of decayAlerts.alerts) {
+      html += `<div style="padding:8px 0; border-bottom:1px solid var(--border); font-size:13px;">
+        <strong>${a.dimension}</strong>: IC dropped ${a.drop_pct ? a.drop_pct.toFixed(0) + '%' : ''}
+        (${a.previous_ic != null ? a.previous_ic.toFixed(4) : '?'} → ${a.current_ic != null ? a.current_ic.toFixed(4) : '?'})
+      </div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Change Log
+  const log = d.change_log || [];
+  if (log.length) {
+    html += `
+    <div style="background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px; margin-bottom:24px;">
+      <h3 style="font-size:15px; margin-bottom:16px;">Weight Optimization Log</h3>
+      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);">
+            <th style="text-align:left; padding:6px 10px; color:var(--text-dim);">Time</th>
+            <th style="text-align:left; padding:6px 10px; color:var(--text-dim);">Source</th>
+            <th style="text-align:left; padding:6px 10px; color:var(--text-dim);">Changes</th>
+          </tr>
+        </thead>
+        <tbody>`;
+
+    for (const entry of log.reverse()) {
+      const ts = entry.timestamp ? new Date(entry.timestamp).toLocaleString() : '?';
+      const src = entry.source || '?';
+      const wObj = entry.weights || {};
+      const reasons = entry.reasons || {};
+      const changes = Object.entries(reasons).map(([k, v]) => `${k}: ${v}`).join(', ');
+      html += `
+          <tr style="border-bottom:1px solid var(--border);">
+            <td style="padding:8px 10px; white-space:nowrap;">${ts}</td>
+            <td style="padding:8px 10px;">${src}</td>
+            <td style="padding:8px 10px; color:var(--text-dim);">${changes || '—'}</td>
+          </tr>`;
+    }
+
+    html += `</tbody></table></div>`;
+  }
+
+  // Agent Cadences
+  const cadences = d.agent_cadences || {};
+  if (Object.keys(cadences).length) {
+    html += `
+    <div style="background:var(--surface); border:1px solid var(--border); border-radius:10px; padding:20px;">
+      <h3 style="font-size:15px; margin-bottom:12px;">Agent Run Cadences</h3>
+      <div style="display:flex; flex-wrap:wrap; gap:12px;">`;
+    for (const [agent, mins] of Object.entries(cadences)) {
+      html += `<div style="background:var(--surface2); border-radius:8px; padding:10px 16px;">
+        <div style="font-size:11px; color:var(--text-dim); text-transform:uppercase;">${agent.replace('_agent', '')}</div>
+        <div style="font-size:18px; font-weight:700; color:var(--cyan);">${mins}m</div>
+      </div>`;
+    }
+    html += `</div></div>`;
+  }
+
+  document.getElementById('content').innerHTML = html;
 }
 
 // ===== HISTORY VIEW =====
