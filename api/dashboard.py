@@ -930,13 +930,13 @@ function switchView(view, btn) {
 }
 
 // ===== SIGNAL HEALTH VIEW =====
-let healthData = null;
+let signalHealthData = null;
 
 async function loadSignalHealth() {
   document.getElementById('content').innerHTML = '<div class="loading"><div class="spinner"></div><span style="color:var(--text-dim)">Loading signal health...</span></div>';
   try {
     const res = await fetch(`${API_BASE}/analytics/signal-health`);
-    healthData = await res.json();
+    signalHealthData = await res.json();
     renderSignalHealth();
   } catch(e) {
     document.getElementById('content').innerHTML = '<div class="loading"><span style="color:var(--red)">Failed to load signal health</span></div>';
@@ -944,8 +944,8 @@ async function loadSignalHealth() {
 }
 
 function renderSignalHealth() {
-  if (!healthData) return;
-  const d = healthData;
+  if (!signalHealthData) return;
+  const d = signalHealthData;
 
   // Header cards
   const regime = d.regime || {};
