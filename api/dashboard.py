@@ -1408,6 +1408,11 @@ function renderAnalytics() {
   const byEndpoint = d.by_endpoint || {};
   const perDay = d.requests_per_day || {};
   const topUAs = d.top_user_agents || [];
+  const bySource = d.by_source || {};
+  const extClients = d.external_unique_clients || 0;
+  const extReqs = bySource.external || 0;
+  const intReqs = bySource.internal || 0;
+  const unkReqs = bySource.unknown || 0;
 
   // Count AI agent requests
   const aiTypes = ['claude', 'openai', 'gemini', 'langchain', 'crewai', 'mcp_client', 'autogpt'];
@@ -1420,15 +1425,17 @@ function renderAnalytics() {
       <div class="analytics-card">
         <div class="ac-label">Total Requests (7d)</div>
         <div class="ac-value" style="color:var(--cyan)">${totalReqs.toLocaleString()}</div>
+        <div class="ac-sub">${extReqs.toLocaleString()} external &middot; ${intReqs.toLocaleString()} internal${unkReqs > 0 ? ' &middot; ' + unkReqs.toLocaleString() + ' unknown' : ''}</div>
+      </div>
+      <div class="analytics-card">
+        <div class="ac-label">External Requests</div>
+        <div class="ac-value" style="color:var(--green)">${extReqs.toLocaleString()}</div>
+        <div class="ac-sub">${extClients} unique clients</div>
       </div>
       <div class="analytics-card">
         <div class="ac-label">AI Agent Requests</div>
-        <div class="ac-value" style="color:var(--green)">${aiReqs.toLocaleString()}</div>
+        <div class="ac-value" style="color:var(--purple, #a78bfa)">${aiReqs.toLocaleString()}</div>
         <div class="ac-sub">${totalReqs > 0 ? ((aiReqs/totalReqs)*100).toFixed(1) : 0}% of total</div>
-      </div>
-      <div class="analytics-card">
-        <div class="ac-label">Unique Clients</div>
-        <div class="ac-value">${uniqueClients}</div>
       </div>
       <div class="analytics-card">
         <div class="ac-label">Avg Response</div>

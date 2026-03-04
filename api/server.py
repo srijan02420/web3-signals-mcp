@@ -19,9 +19,11 @@ Endpoints:
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
+import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -34,6 +36,17 @@ from shared.storage import Storage
 from signal_fusion.engine import SignalFusion
 from api.dashboard import DASHBOARD_HTML
 
+# ---------------------------------------------------------------------------
+# Logging — structured output for Railway
+# ---------------------------------------------------------------------------
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+logger = logging.getLogger("web3signals")
+
 # x402 payment gate (enabled when PAY_TO env var is set)
 try:
     from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
@@ -43,13 +56,13 @@ try:
     from x402.mechanisms.evm.exact import ExactEvmServerScheme
     from x402.server import x402ResourceServer
     _X402_AVAILABLE = True
-    print("x402: imports OK")
+    logger.info("x402: imports OK")
 except ImportError as _x402_err:
     _X402_AVAILABLE = False
-    print(f"x402: IMPORT FAILED — {_x402_err}")
+    logger.error("x402: IMPORT FAILED — %s", _x402_err)
 except Exception as _x402_err:
     _X402_AVAILABLE = False
-    print(f"x402: UNEXPECTED ERROR — {_x402_err}")
+    logger.error("x402: UNEXPECTED ERROR — %s", _x402_err)
 
 # ---------------------------------------------------------------------------
 # Globals — set on startup
@@ -86,7 +99,7 @@ def _build_cdp_auth_provider():
     Uses the cdp-sdk's generate_jwt() if available, otherwise returns None.
     """
     if not _CDP_API_KEY_ID or not _CDP_API_KEY_SECRET:
-        print("x402: no CDP_API_KEY_ID/SECRET — facilitator may reject unauthenticated requests")
+        logger.warning("x402: no CDP_API_KEY_ID/SECRET — facilitator may reject unauthenticated requests")
         return None
 
     try:
@@ -109,13 +122,13 @@ def _build_cdp_auth_provider():
                 }
             return headers
 
-        print(f"x402: CDP auth configured (key_id={_CDP_API_KEY_ID[:12]}...)")
+        logger.info("x402: CDP auth configured (key_id=%s...)", _CDP_API_KEY_ID[:12])
         return CreateHeadersAuthProvider(create_headers)
     except ImportError:
-        print("x402: cdp-sdk not installed — cannot authenticate with CDP facilitator")
+        logger.warning("x402: cdp-sdk not installed — cannot authenticate with CDP facilitator")
         return None
     except Exception as e:
-        print(f"x402: CDP auth setup failed — {e}")
+        logger.error("x402: CDP auth setup failed — %s", e)
         return None
 
 
@@ -132,11 +145,11 @@ if _X402_ENABLED:
     # If facilitator is unreachable, disable x402 gracefully (app stays up, routes free).
     try:
         _x402_server.initialize()
-        print(f"x402: facilitator OK ({_X402_FACILITATOR_URL})")
+        logger.info("x402: facilitator OK (%s)", _X402_FACILITATOR_URL)
     except Exception as _init_exc:
         _x402_init_error = str(_init_exc)
-        print(f"x402: FACILITATOR INIT FAILED — {_init_exc}")
-        print(f"x402: disabling payment gate — routes will be free until fixed")
+        logger.error("x402: FACILITATOR INIT FAILED — %s", _init_exc)
+        logger.warning("x402: disabling payment gate — routes will be free until fixed")
         _X402_ENABLED = False
         _x402_server = None
 
@@ -188,7 +201,7 @@ if _X402_ENABLED:
             }},
         ),
     }
-    print(f"x402: configured {len(_x402_routes)} paid routes (pay_to={_PAY_TO[:10]}...)")
+    logger.info("x402: configured %d paid routes (pay_to=%s...)", len(_x402_routes), _PAY_TO[:10])
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +216,7 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
 
     while _orchestrator_running:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"[{ts}] Orchestrator: starting agent run...")
+        logger.info("[%s] Orchestrator: starting agent run...", ts)
 
         agents = []
 
@@ -211,31 +224,31 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
             from technical_agent.engine import TechnicalAgent
             agents.append(("technical_agent", TechnicalAgent))
         except ImportError as e:
-            print(f"  technical_agent: import error — {e}")
+            logger.error("  technical_agent: import error — %s", e)
 
         try:
             from derivatives_agent.engine import DerivativesAgent
             agents.append(("derivatives_agent", DerivativesAgent))
         except ImportError as e:
-            print(f"  derivatives_agent: import error — {e}")
+            logger.error("  derivatives_agent: import error — %s", e)
 
         try:
             from market_agent.engine import MarketAgent
             agents.append(("market_agent", MarketAgent))
         except ImportError as e:
-            print(f"  market_agent: import error — {e}")
+            logger.error("  market_agent: import error — %s", e)
 
         try:
             from narrative_agent.engine import NarrativeAgent
             agents.append(("narrative_agent", NarrativeAgent))
         except ImportError as e:
-            print(f"  narrative_agent: import error — {e}")
+            logger.error("  narrative_agent: import error — %s", e)
 
         try:
             from whale_agent.engine import WhaleAgent
             agents.append(("whale_agent", WhaleAgent))
         except ImportError as e:
-            print(f"  whale_agent: import error — {e}")
+            logger.error("  whale_agent: import error — %s", e)
 
         for name, factory in agents:
             try:
@@ -245,9 +258,9 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 status = result["status"]
                 ms = result["meta"]["duration_ms"]
                 errs = len(result["meta"]["errors"])
-                print(f"  {name}: {status} ({ms}ms, {errs} errors)")
+                logger.info("  %s: %s (%sms, %s errors)", name, status, ms, errs)
             except Exception as exc:
-                print(f"  {name}: CRASH — {exc}")
+                logger.error("  %s: CRASH — %s", name, exc)
 
         # Run signal fusion and save to storage (pre-computes so /signal is instant)
         try:
@@ -256,9 +269,9 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
             store.save("signal_fusion", fusion_result)
             f_status = fusion_result.get("status", "unknown")
             f_ms = fusion_result.get("meta", {}).get("duration_ms", 0)
-            print(f"  signal_fusion: {f_status} ({f_ms}ms)")
+            logger.info("  signal_fusion: %s (%sms)", f_status, f_ms)
         except Exception as exc:
-            print(f"  signal_fusion: CRASH — {exc}")
+            logger.error("  signal_fusion: CRASH — %s", exc)
 
         # --- 12-hour LLM Sentiment Cycle ---
         # Runs narrative LLM sentiment analysis every 12 hours (not every 15 min)
@@ -275,23 +288,23 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 should_run_llm = True
 
             if should_run_llm:
-                print(f"  [LLM] Running 12-hour narrative sentiment analysis...")
+                logger.info("  [LLM] Running 12-hour narrative sentiment analysis...")
                 try:
                     from narrative_agent.engine import NarrativeAgent
                     narrator = NarrativeAgent()
                     llm_result = narrator.run_llm_sentiment(store)
                     store.save_kv("llm_cycle", "last_run", now_ts)
-                    print(f"  [LLM] Done: {llm_result}")
+                    logger.info("  [LLM] Done: %s", llm_result)
                 except Exception as llm_exc:
-                    print(f"  [LLM] Error: {llm_exc}")
+                    logger.error("  [LLM] Error: %s", llm_exc)
         except Exception as exc:
-            print(f"  llm_cycle: {exc}")
+            logger.error("  llm_cycle: %s", exc)
 
         # Record performance snapshot for accuracy tracking
         try:
             _record_performance_snapshot(store)
         except Exception as exc:
-            print(f"  performance snapshot: {exc}")
+            logger.error("  performance snapshot: %s", exc)
 
         # Evaluate old snapshots for accuracy (every 4 hours)
         try:
@@ -305,7 +318,7 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 should_eval = True
 
             if should_eval:
-                print(f"  [PERF] Running accuracy evaluation...")
+                logger.info("  [PERF] Running accuracy evaluation...")
                 _evaluate_old_snapshots(store)
                 store.save_kv("perf_eval", "last_run", now_ts)
 
@@ -320,20 +333,20 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                     optimizer = WeightOptimizer(store, profile)
 
                     if optimizer.is_enabled() and optimizer.should_optimize():
-                        print(f"  [LEARN] Running weight optimization...")
+                        logger.info("  [LEARN] Running weight optimization...")
                         new_weights = optimizer.compute_and_apply()
                         if new_weights:
-                            print(f"  [LEARN] Updated weights: {new_weights}")
+                            logger.info("  [LEARN] Updated weights: %s", new_weights)
                         else:
-                            print(f"  [LEARN] Not enough data for optimization yet")
+                            logger.info("  [LEARN] Not enough data for optimization yet")
                 except Exception as opt_exc:
-                    print(f"  weight optimizer: {opt_exc}")
+                    logger.error("  weight optimizer: %s", opt_exc)
 
         except Exception as exc:
-            print(f"  performance eval: {exc}")
+            logger.error("  performance eval: %s", exc)
 
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-        print(f"[{ts}] Orchestrator: done. Sleeping {interval}s.\n")
+        logger.info("[%s] Orchestrator: done. Sleeping %ss.", ts, interval)
 
         # Sleep in small increments so we can stop quickly
         for _ in range(interval):
@@ -413,7 +426,7 @@ def _record_performance_snapshot(store: Storage) -> None:
 
     if saved:
         store.save_kv("perf_snapshot", "last_run", now_ts)
-        print(f"  performance: saved {saved} snapshots (next in {snapshot_interval}h)")
+        logger.info("  performance: saved %s snapshots (next in %sh)", saved, snapshot_interval)
 
 
 def _calculate_gradient_score(
@@ -456,7 +469,7 @@ def _evaluate_old_snapshots(store: Storage) -> None:
     # Get current prices from the market agent's latest run (already in storage)
     market = store.load_latest("market_agent")
     if not market:
-        print("  performance eval: no market agent data in storage")
+        logger.warning("  performance eval: no market agent data in storage")
         return
 
     per_asset = market.get("data", {}).get("per_asset", {})
@@ -467,7 +480,7 @@ def _evaluate_old_snapshots(store: Storage) -> None:
             current_prices[asset] = float(p)
 
     if not current_prices:
-        print("  performance eval: no prices in market agent data")
+        logger.warning("  performance eval: no prices in market agent data")
         return
 
     # Load gradient scoring config from fusion profile
@@ -517,9 +530,9 @@ def _evaluate_old_snapshots(store: Storage) -> None:
             total_evaluated += 1
 
     if total_evaluated:
-        print(f"  [PERF] Evaluated {total_evaluated} snapshots across {len(windows)} windows")
+        logger.info("  [PERF] Evaluated %s snapshots across %s windows", total_evaluated, len(windows))
     else:
-        print(f"  [PERF] No snapshots ready for evaluation yet (need 24h+ age)")
+        logger.info("  [PERF] No snapshots ready for evaluation yet (need 24h+ age)")
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +556,7 @@ async def lifespan(app: FastAPI):
         name="orchestrator",
     )
     _orchestrator_thread.start()
-    print(f"Orchestrator started (interval={interval}s)")
+    logger.info("Orchestrator started (interval=%ss)", interval)
 
     yield
 
@@ -551,7 +564,7 @@ async def lifespan(app: FastAPI):
     _orchestrator_running = False
     if _orchestrator_thread:
         _orchestrator_thread.join(timeout=5)
-    print("Orchestrator stopped")
+    logger.info("Orchestrator stopped")
 
 
 # ---------------------------------------------------------------------------
@@ -567,6 +580,59 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+
+# ---------------------------------------------------------------------------
+# Internal API key for tagging requests as internal
+# ---------------------------------------------------------------------------
+_INTERNAL_API_KEY = os.getenv("INTERNAL_API_KEY", "")
+
+
+def _get_real_ip(request: Request) -> str:
+    """Extract real client IP from reverse proxy headers.
+
+    Railway sets X-Forwarded-For. Priority:
+    X-Forwarded-For (first IP) > X-Real-IP > request.client.host
+    """
+    xff = request.headers.get("x-forwarded-for", "")
+    if xff:
+        return xff.split(",")[0].strip()
+    xri = request.headers.get("x-real-ip", "")
+    if xri:
+        return xri.strip()
+    return request.client.host if request.client else ""
+
+
+def _classify_request_source(request: Request) -> str:
+    """Classify request as 'internal', 'external', or 'unknown'.
+
+    Detection layers (first match wins):
+    1. X-Internal-Key header matches INTERNAL_API_KEY env var -> internal
+    2. Dashboard/internal API paths -> internal
+    3. Postman without payment header -> internal
+    4. Everything else -> external
+    """
+    # Layer 1: Explicit header (most reliable)
+    if _INTERNAL_API_KEY:
+        internal_header = request.headers.get("x-internal-key", "")
+        if internal_header == _INTERNAL_API_KEY:
+            return "internal"
+
+    # Layer 2: Internal API paths
+    path = request.url.path
+    if path.startswith("/api/") or path == "/dashboard":
+        return "internal"
+
+    # Layer 3: Development tool user-agents (only when NO payment header)
+    ua = (request.headers.get("user-agent", "") or "").lower()
+    has_payment = bool(request.headers.get("payment-signature", ""))
+
+    if not has_payment:
+        if "postman" in ua:
+            return "internal"
+
+    # Layer 4: Everything else is external
+    return "external"
 
 
 # ---------------------------------------------------------------------------
@@ -620,7 +686,10 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         try:
             if _store:
                 ua = request.headers.get("user-agent", "")
-                client_ip = request.client.host if request.client else ""
+                client_ip = _get_real_ip(request)
+                request_source = _classify_request_source(request)
+                referer = request.headers.get("referer", "")
+                origin = request.headers.get("origin", "")
                 _store.save_api_request(
                     endpoint=path,
                     method=request.method,
@@ -629,9 +698,13 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     duration_ms=round(duration_ms, 1),
                     client_ip=client_ip,
                     payment_status=payment_status,
+                    request_source=request_source,
+                    referer=referer,
+                    origin=origin,
                 )
         except Exception:
-            pass  # Never break the response for tracking
+            logger.warning("Usage tracking failed for %s %s: %s",
+                           request.method, path, traceback.format_exc(limit=1))
 
         return response
 
@@ -641,7 +714,7 @@ app.add_middleware(UsageTrackingMiddleware)
 # x402 middleware — runs BEFORE usage tracking (LIFO order)
 if _X402_ENABLED:
     app.add_middleware(PaymentMiddlewareASGI, routes=_x402_routes, server=_x402_server)
-    print(f"x402 payment gate enabled (facilitator={_X402_FACILITATOR_URL})")
+    logger.info("x402 payment gate enabled (facilitator=%s)", _X402_FACILITATOR_URL)
 
 
 # ---------------------------------------------------------------------------
@@ -664,6 +737,7 @@ async def root():
             "/performance/{asset}": "Per-asset accuracy breakdown",
             "/analytics": "API usage analytics — who's using us, request trends",
             "/analytics/x402": "x402 payment analytics — paid calls, revenue, conversion rate",
+            "/analytics/insights": "Growth insights — external vs internal, AI agent trends, revenue split",
             "/api/history": "Paginated history of all agent runs",
         },
         "discovery": {
@@ -1018,9 +1092,15 @@ async def get_analytics(days: int = Query(7, ge=1, le=90, description="Number of
         "by_client_type": stats["by_user_agent_type"],
         "requests_per_day": stats["requests_per_day"],
         "top_user_agents": stats["top_user_agents"],
+        "by_source": stats.get("by_source", {}),
+        "external_unique_clients": stats.get("external_unique_ips", 0),
+        "external_requests_per_day": stats.get("external_requests_per_day", {}),
+        "external_by_client_type": stats.get("external_by_client_type", {}),
         "x402_payments": {
             "total_paid_calls": x402_stats["total_paid_calls"],
             "estimated_revenue_usdc": x402_stats["estimated_revenue_usdc"],
+            "external_paid_calls": x402_stats.get("external_paid_calls", 0),
+            "external_revenue_usdc": x402_stats.get("external_revenue_usdc", 0.0),
             "total_402_challenges": x402_stats["total_402_challenges"],
             "conversion_rate_pct": (
                 round(x402_stats["total_paid_calls"] / x402_stats["total_402_challenges"] * 100, 1)
@@ -1065,10 +1145,83 @@ async def get_x402_analytics(
         "total_payment_failures": stats["total_payment_failures"],
         "conversion_rate_pct": conversion,
         "estimated_revenue_usdc": stats["estimated_revenue_usdc"],
+        "paid_by_source": stats.get("paid_by_source", {}),
+        "external_paid_calls": stats.get("external_paid_calls", 0),
+        "internal_paid_calls": stats.get("internal_paid_calls", 0),
+        "external_revenue_usdc": stats.get("external_revenue_usdc", 0.0),
         "by_endpoint": stats["by_endpoint"],
         "by_client_type": stats["by_client_type"],
         "paid_per_day": stats["paid_per_day"],
         "avg_paid_latency_ms": stats["avg_paid_latency_ms"],
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/insights — Growth insights (are external calls increasing?)
+# ---------------------------------------------------------------------------
+@app.get("/analytics/insights", tags=["analytics"])
+async def get_analytics_insights(
+    days: int = Query(30, ge=1, le=90, description="Number of days to analyze"),
+):
+    """Growth insights — external AI agent call trends, source segmentation, revenue split."""
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    stats = _store.load_api_analytics(days=days)
+    x402_stats = _store.load_x402_analytics(days=days)
+
+    total = max(stats.get("total_requests", 0), 1)
+    by_source = stats.get("by_source", {})
+    external_total = by_source.get("external", 0)
+    internal_total = by_source.get("internal", 0)
+    unknown_total = by_source.get("unknown", 0)
+
+    # Growth: compare first half vs second half of external daily trend
+    ext_daily = stats.get("external_requests_per_day", {})
+    daily_sorted = sorted(ext_daily.items())
+    growth_pct = None
+    if len(daily_sorted) >= 4:
+        mid = len(daily_sorted) // 2
+        first_half_avg = sum(v for _, v in daily_sorted[:mid]) / mid
+        second_half_avg = sum(v for _, v in daily_sorted[mid:]) / (len(daily_sorted) - mid)
+        if first_half_avg > 0:
+            growth_pct = round((second_half_avg - first_half_avg) / first_half_avg * 100, 1)
+
+    ext_client_types = stats.get("external_by_client_type", {})
+    ai_types = {k: v for k, v in ext_client_types.items()
+                if k in ("claude", "openai", "gemini", "langchain", "crewai", "mcp_client", "autogpt")}
+
+    return {
+        "window_days": days,
+        "summary": {
+            "total_requests": stats.get("total_requests", 0),
+            "external_requests": external_total,
+            "internal_requests": internal_total,
+            "unknown_requests": unknown_total,
+            "external_pct": round(external_total / total * 100, 1),
+        },
+        "growth": {
+            "external_daily_trend": ext_daily,
+            "growth_pct": growth_pct,
+            "interpretation": (
+                f"External requests {'growing' if growth_pct and growth_pct > 0 else 'declining' if growth_pct and growth_pct < 0 else 'stable'}"
+                + (f" at {growth_pct}% over {days}d" if growth_pct is not None else " (insufficient data)")
+            ),
+        },
+        "external_clients": {
+            "unique_ips": stats.get("external_unique_ips", 0),
+            "by_type": ext_client_types,
+            "ai_agent_types": ai_types,
+            "ai_agent_total": sum(ai_types.values()),
+        },
+        "revenue": {
+            "total_revenue_usdc": x402_stats.get("estimated_revenue_usdc", 0),
+            "external_revenue_usdc": x402_stats.get("external_revenue_usdc", 0.0),
+            "internal_paid_calls": x402_stats.get("internal_paid_calls", 0),
+            "external_paid_calls": x402_stats.get("external_paid_calls", 0),
+            "paid_by_source": x402_stats.get("paid_by_source", {}),
+        },
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1389,11 +1542,11 @@ try:
         Mount("/mcp/messages", app=_mcp_sse_transport.handle_post_message)
     )
 
-    print("MCP SSE transport mounted at /mcp/sse")
+    logger.info("MCP SSE transport mounted at /mcp/sse")
 except ImportError as e:
-    print(f"MCP SSE mount skipped — {e}")
+    logger.warning("MCP SSE mount skipped — %s", e)
 except Exception as e:
-    print(f"MCP SSE mount error — {e}")
+    logger.error("MCP SSE mount error — %s", e)
 
 
 # ---------------------------------------------------------------------------

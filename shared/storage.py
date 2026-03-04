@@ -6,6 +6,10 @@ import os
 import re
 import sqlite3
 from typing import Any, Dict, List, Optional
+import logging
+import traceback
+
+logger = logging.getLogger("web3signals.storage")
 
 
 def _get_backend() -> str:
@@ -803,12 +807,16 @@ class Storage:
     def save_api_request(self, endpoint: str, method: str, user_agent: str,
                           status_code: int, duration_ms: float,
                           client_ip: str = "",
-                          payment_status: str | None = None) -> None:
+                          payment_status: str | None = None,
+                          request_source: str = "unknown",
+                          referer: str = "",
+                          origin: str = "") -> None:
         """Log an API request for analytics.
 
         payment_status: None (not a paid route), 'payment_required' (402),
                         'paid' (200 with payment header), 'payment_failed',
                         'free' (paid route served free — gate disabled).
+        request_source: 'internal', 'external', or 'unknown'.
         """
         table = "api_requests"
         now = datetime.now(timezone.utc).isoformat()
@@ -835,19 +843,23 @@ class Storage:
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS idx_{table}_ep ON {table} (endpoint)"
                     )
-                    # Add payment_status column if table exists without it
-                    try:
-                        cur.execute(
-                            f"ALTER TABLE {table} ADD COLUMN payment_status TEXT"
-                        )
-                    except Exception:
-                        pass  # Column already exists
+                    # Migrate: add columns if they don't exist
+                    for col in ["payment_status TEXT", "request_source TEXT DEFAULT 'unknown'",
+                                "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''"]:
+                        try:
+                            cur.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+                        except Exception:
+                            logger.debug("Column migration skipped (already exists): %s", col.split()[0])
+                    cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_{table}_source ON {table} (request_source)"
+                    )
                     cur.execute(
                         f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
-                        f"status_code, duration_ms, client_ip, payment_status) "
-                        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                        f"status_code, duration_ms, client_ip, payment_status, "
+                        f"request_source, referer, origin) "
+                        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (now, endpoint, method, user_agent, status_code, duration_ms,
-                         client_ip, payment_status),
+                         client_ip, payment_status, request_source, referer, origin),
                     )
                 conn.commit()
         else:
@@ -871,19 +883,23 @@ class Storage:
                 conn.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_{table}_ep ON {table} (endpoint)"
                 )
-                # Add payment_status column if table exists without it
-                try:
-                    conn.execute(
-                        f"ALTER TABLE {table} ADD COLUMN payment_status TEXT"
-                    )
-                except Exception:
-                    pass  # Column already exists
+                # Migrate: add columns if they don't exist
+                for col in ["payment_status TEXT", "request_source TEXT DEFAULT 'unknown'",
+                            "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''"]:
+                    try:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+                    except Exception:
+                        logger.debug("Column migration skipped (already exists): %s", col.split()[0])
+                conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{table}_source ON {table} (request_source)"
+                )
                 conn.execute(
                     f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
-                    f"status_code, duration_ms, client_ip, payment_status) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    f"status_code, duration_ms, client_ip, payment_status, "
+                    f"request_source, referer, origin) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (now, endpoint, method, user_agent, status_code, duration_ms,
-                     client_ip, payment_status),
+                     client_ip, payment_status, request_source, referer, origin),
                 )
                 conn.commit()
 
@@ -900,6 +916,10 @@ class Storage:
             "requests_per_day": {},
             "avg_duration_ms": 0,
             "top_user_agents": [],
+            "by_source": {"internal": 0, "external": 0, "unknown": 0},
+            "external_unique_ips": 0,
+            "external_requests_per_day": {},
+            "external_by_client_type": {},
         }
 
         if self.backend == "postgres":
@@ -967,8 +987,48 @@ class Storage:
                         row = cur.fetchone()
                         result["avg_duration_ms"] = round(float(row[0]), 1) if row and row[0] else 0
 
+                        # --- Source segmentation (internal / external) ---
+                        cur.execute(
+                            f"SELECT COALESCE(request_source, 'unknown'), COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s GROUP BY COALESCE(request_source, 'unknown')",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            result["by_source"][row[0]] = row[1]
+
+                        cur.execute(
+                            f"SELECT COUNT(DISTINCT client_ip) FROM {table} "
+                            f"WHERE timestamp >= %s AND client_ip != '' "
+                            f"AND COALESCE(request_source, 'unknown') = 'external'",
+                            (since,),
+                        )
+                        row = cur.fetchone()
+                        result["external_unique_ips"] = row[0] if row else 0
+
+                        cur.execute(
+                            f"SELECT LEFT(timestamp, 10) as day, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND COALESCE(request_source, 'unknown') = 'external' "
+                            f"GROUP BY LEFT(timestamp, 10) ORDER BY day",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            result["external_requests_per_day"][row[0]] = row[1]
+
+                        cur.execute(
+                            f"SELECT user_agent, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND COALESCE(request_source, 'unknown') = 'external' "
+                            f"GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 20",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            ua = row[0] or "unknown"
+                            ua_type = _classify_user_agent(ua)
+                            result["external_by_client_type"][ua_type] = (
+                                result["external_by_client_type"].get(ua_type, 0) + row[1]
+                            )
+
             except Exception:
-                pass
+                logger.error("load_api_analytics (postgres) failed: %s", traceback.format_exc(limit=1))
         else:
             try:
                 with sqlite3.connect(self.db_path) as conn:
@@ -1023,8 +1083,48 @@ class Storage:
                         (since,),
                     ).fetchone()
                     result["avg_duration_ms"] = round(float(row[0]), 1) if row and row[0] else 0
+
+                    # --- Source segmentation (internal / external) ---
+                    rows = conn.execute(
+                        f"SELECT COALESCE(request_source, 'unknown'), COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? GROUP BY COALESCE(request_source, 'unknown')",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        result["by_source"][row[0]] = row[1]
+
+                    row = conn.execute(
+                        f"SELECT COUNT(DISTINCT client_ip) FROM {table} "
+                        f"WHERE timestamp >= ? AND client_ip != '' "
+                        f"AND COALESCE(request_source, 'unknown') = 'external'",
+                        (since,),
+                    ).fetchone()
+                    result["external_unique_ips"] = row[0] if row else 0
+
+                    rows = conn.execute(
+                        f"SELECT SUBSTR(timestamp, 1, 10) as day, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND COALESCE(request_source, 'unknown') = 'external' "
+                        f"GROUP BY SUBSTR(timestamp, 1, 10) ORDER BY day",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        result["external_requests_per_day"][row[0]] = row[1]
+
+                    rows = conn.execute(
+                        f"SELECT user_agent, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND COALESCE(request_source, 'unknown') = 'external' "
+                        f"GROUP BY user_agent ORDER BY COUNT(*) DESC LIMIT 20",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        ua = row[0] or "unknown"
+                        ua_type = _classify_user_agent(ua)
+                        result["external_by_client_type"][ua_type] = (
+                            result["external_by_client_type"].get(ua_type, 0) + row[1]
+                        )
+
             except Exception:
-                pass
+                logger.error("load_api_analytics (sqlite) failed: %s", traceback.format_exc(limit=1))
 
         return result
 
@@ -1045,6 +1145,10 @@ class Storage:
             "by_endpoint": {},
             "by_client_type": {},
             "paid_per_day": {},
+            "paid_by_source": {"internal": 0, "external": 0, "unknown": 0},
+            "external_paid_calls": 0,
+            "internal_paid_calls": 0,
+            "external_revenue_usdc": 0.0,
             "avg_paid_latency_ms": 0,
         }
 
@@ -1130,8 +1234,24 @@ class Storage:
 
                         _process_rows(paid, challenges, fails, ep_rows,
                                       client_rows, daily_rows, avg)
+
+                        # --- Source segmentation for paid calls ---
+                        cur.execute(
+                            f"SELECT COALESCE(request_source, 'unknown'), COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'paid' "
+                            f"GROUP BY COALESCE(request_source, 'unknown')",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            result["paid_by_source"][row[0]] = row[1]
+                        result["external_paid_calls"] = result["paid_by_source"].get("external", 0)
+                        result["internal_paid_calls"] = result["paid_by_source"].get("internal", 0)
+                        result["external_revenue_usdc"] = round(
+                            result["external_paid_calls"] * 0.001, 4
+                        )
+
             except Exception:
-                pass
+                logger.error("load_x402_analytics (postgres) failed: %s", traceback.format_exc(limit=1))
         else:
             try:
                 with sqlite3.connect(self.db_path) as conn:
@@ -1183,8 +1303,24 @@ class Storage:
 
                     _process_rows(paid, challenges, fails, ep_rows,
                                   client_rows, daily_rows, avg)
+
+                    # --- Source segmentation for paid calls ---
+                    rows = conn.execute(
+                        f"SELECT COALESCE(request_source, 'unknown'), COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'paid' "
+                        f"GROUP BY COALESCE(request_source, 'unknown')",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        result["paid_by_source"][row[0]] = row[1]
+                    result["external_paid_calls"] = result["paid_by_source"].get("external", 0)
+                    result["internal_paid_calls"] = result["paid_by_source"].get("internal", 0)
+                    result["external_revenue_usdc"] = round(
+                        result["external_paid_calls"] * 0.001, 4
+                    )
+
             except Exception:
-                pass
+                logger.error("load_x402_analytics (sqlite) failed: %s", traceback.format_exc(limit=1))
 
         return result
 
