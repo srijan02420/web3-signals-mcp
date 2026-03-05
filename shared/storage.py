@@ -1154,6 +1154,18 @@ class Storage:
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS idx_api_requests_refsrc ON {table} (referer_source)"
                     )
+                    # --- One-time data cleanup: reclassify owner's test traffic ---
+                    # Old test scripts (python-httpx, curl) were tagged 'external'.
+                    # Reclassify to 'internal'. Idempotent — only touches rows
+                    # where user_agent matches known test tools AND source = 'external'.
+                    cur.execute(
+                        f"UPDATE {table} SET request_source = 'internal' "
+                        f"WHERE request_source = 'external' AND ("
+                        f"  user_agent LIKE 'python-httpx%%' "
+                        f"  OR user_agent LIKE 'Python-urllib%%' "
+                        f"  OR user_agent LIKE 'curl%%'"
+                        f")"
+                    )
                     cur.execute(
                         f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
                         f"status_code, duration_ms, client_ip, payment_status, "
@@ -1198,6 +1210,15 @@ class Storage:
                 )
                 conn.execute(
                     f"CREATE INDEX IF NOT EXISTS idx_api_requests_refsrc ON {table} (referer_source)"
+                )
+                # --- One-time data cleanup: reclassify owner's test traffic ---
+                conn.execute(
+                    f"UPDATE {table} SET request_source = 'internal' "
+                    f"WHERE request_source = 'external' AND ("
+                    f"  user_agent LIKE 'python-httpx%' "
+                    f"  OR user_agent LIKE 'Python-urllib%' "
+                    f"  OR user_agent LIKE 'curl%'"
+                    f")"
                 )
                 conn.execute(
                     f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
