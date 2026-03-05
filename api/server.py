@@ -662,9 +662,27 @@ async def lifespan(app: FastAPI):
     _orchestrator_thread.start()
     logger.info("Orchestrator started (interval=%ss)", interval)
 
+    # Start MCP Streamable HTTP session manager if available
+    _mcp_session_ctx = None
+    try:
+        from mcp_server.server import mcp as _mcp_inst
+        if hasattr(_mcp_inst, '_session_manager') and _mcp_inst._session_manager is not None:
+            _mcp_session_ctx = _mcp_inst.session_manager.run()
+            await _mcp_session_ctx.__aenter__()
+            logger.info("MCP session manager started")
+    except Exception as e:
+        logger.debug("MCP session manager not started — %s", e)
+
     yield
 
-    # Shutdown
+    # Shutdown MCP session manager
+    if _mcp_session_ctx is not None:
+        try:
+            await _mcp_session_ctx.__aexit__(None, None, None)
+        except Exception:
+            pass
+
+    # Shutdown orchestrator
     _orchestrator_running = False
     if _orchestrator_thread:
         _orchestrator_thread.join(timeout=5)
@@ -1897,6 +1915,7 @@ async def agent_card():
             "rest": f"{base_url}/docs",
             "openapi": f"{base_url}/openapi.json",
             "mcp_sse": f"{base_url}/mcp/sse",
+            "mcp_streamable_http": f"{base_url}/mcp/stream",
             "a2a": f"{base_url}/.well-known/agent.json",
             "agents_md": f"{base_url}/.well-known/agents.md",
         },
@@ -1968,7 +1987,8 @@ async def x402_discovery():
             "agent_card": f"{base_url}/.well-known/agent.json",
             "agents_md": f"{base_url}/.well-known/agents.md",
             "openapi": f"{base_url}/openapi.json",
-            "mcp": f"{base_url}/mcp/sse",
+            "mcp_sse": f"{base_url}/mcp/sse",
+            "mcp_streamable_http": f"{base_url}/mcp/stream",
         },
     }
 
@@ -2067,19 +2087,19 @@ async def get_signal_history(
 
 
 # ---------------------------------------------------------------------------
-# MCP SSE Transport — direct routes on /mcp/sse and /mcp/messages
+# MCP Transports — SSE (legacy) + Streamable HTTP (modern)
 # ---------------------------------------------------------------------------
 try:
     from mcp.server.sse import SseServerTransport
     from mcp_server.server import mcp as mcp_server_instance
     from starlette.responses import Response
 
-    # Create SSE transport with /mcp/messages as the POST endpoint
+    # --- Legacy SSE transport at /mcp/sse (backward compat) ---
     _mcp_sse_transport = SseServerTransport("/mcp/messages")
 
     @app.get("/mcp/sse", include_in_schema=False)
     async def mcp_sse_endpoint(request: Request):
-        """MCP SSE endpoint — AI agents connect here for real-time tool access."""
+        """MCP SSE endpoint — legacy transport for older clients."""
         from starlette.responses import Response as StarletteResponse
 
         async with _mcp_sse_transport.connect_sse(
@@ -2092,17 +2112,26 @@ try:
             )
         return StarletteResponse()
 
-    # Mount the messages POST handler
     from starlette.routing import Mount
     app.router.routes.append(
         Mount("/mcp/messages", app=_mcp_sse_transport.handle_post_message)
     )
-
     logger.info("MCP SSE transport mounted at /mcp/sse")
+
+    # --- Streamable HTTP transport (modern, Smithery-compatible) ---
+    # Separate path to avoid conflicting with SSE at /mcp/sse + /mcp/messages.
+    # Smithery/modern clients use: https://...railway.app/mcp/stream
+    try:
+        _streamable_app = mcp_server_instance.streamable_http_app()
+        app.mount("/mcp/stream", _streamable_app)
+        logger.info("MCP Streamable HTTP transport mounted at /mcp/stream")
+    except Exception as e:
+        logger.warning("MCP Streamable HTTP mount skipped — %s", e)
+
 except ImportError as e:
-    logger.warning("MCP SSE mount skipped — %s", e)
+    logger.warning("MCP transport mount skipped — %s", e)
 except Exception as e:
-    logger.error("MCP SSE mount error — %s", e)
+    logger.error("MCP transport mount error — %s", e)
 
 
 # ---------------------------------------------------------------------------
