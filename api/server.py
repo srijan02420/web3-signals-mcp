@@ -142,6 +142,18 @@ if _X402_ENABLED:
     _x402_server = x402ResourceServer(_facilitator)
     _x402_server.register("eip155:8453", ExactEvmServerScheme())  # Base mainnet
 
+    # Register Bazaar discovery extension so the CDP facilitator indexes us
+    try:
+        from x402.extensions.bazaar import (
+            bazaar_resource_server_extension,
+            declare_discovery_extension,
+        )
+        _x402_server.register_extension(bazaar_resource_server_extension)
+        logger.info("x402: Bazaar discovery extension registered")
+    except ImportError:
+        logger.warning("x402: Bazaar extension not available — skipping discovery")
+        declare_discovery_extension = None
+
     # Eagerly initialize: connect to facilitator NOW, not on first request.
     # If facilitator is unreachable, disable x402 gracefully (app stays up, routes free).
     try:
@@ -160,6 +172,23 @@ if _X402_ENABLED:
         scheme="exact", pay_to=_PAY_TO, price="$0.001",
         network="eip155:8453",
     )
+
+    # Build Bazaar discovery extensions using the official SDK helper
+    _bazaar_signal = (
+        declare_discovery_extension(input={"method": "GET"})
+        if declare_discovery_extension else {}
+    )
+    _bazaar_signal_asset = (
+        declare_discovery_extension(
+            input={"method": "GET", "path_params": {"asset": "BTC"}},
+        )
+        if declare_discovery_extension else {}
+    )
+    _bazaar_reputation = (
+        declare_discovery_extension(input={"method": "GET"})
+        if declare_discovery_extension else {}
+    )
+
     _x402_routes = {
         "GET /signal": X402RouteConfig(
             accepts=[_payment_option],
@@ -169,11 +198,7 @@ if _X402_ENABLED:
                 "Portfolio summary + LLM insights."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {
-                "discoverable": True,
-                "info": {"input": {"method": "GET"}},
-                "schema": {"properties": {"input": {"required": ["method"]}}},
-            }},
+            extensions=_bazaar_signal,
         ),
         "GET /signal/*": X402RouteConfig(
             accepts=[_payment_option],
@@ -182,11 +207,7 @@ if _X402_ENABLED:
                 "direction, momentum, and market context."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {
-                "discoverable": True,
-                "info": {"input": {"method": "GET", "path_params": {"asset": "BTC"}}},
-                "schema": {"properties": {"input": {"required": ["method"]}}},
-            }},
+            extensions=_bazaar_signal_asset,
         ),
         "GET /performance/reputation": X402RouteConfig(
             accepts=[_payment_option],
@@ -195,11 +216,7 @@ if _X402_ENABLED:
                 "per-asset breakdown. Verifiable reputation score."
             ),
             mime_type="application/json",
-            extensions={"bazaar": {
-                "discoverable": True,
-                "info": {"input": {"method": "GET"}},
-                "schema": {"properties": {"input": {"required": ["method"]}}},
-            }},
+            extensions=_bazaar_reputation,
         ),
     }
     logger.info("x402: configured %d paid routes (pay_to=%s...)", len(_x402_routes), _PAY_TO[:10])
