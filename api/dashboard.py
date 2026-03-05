@@ -569,6 +569,40 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .ep-bar { height: 100%; background: var(--cyan); border-radius: 4px; }
 
+  /* Attribution bars */
+  .attr-section { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 24px; }
+  .attr-row { display: flex; align-items: center; gap: 12px; padding: 6px 0; }
+  .attr-label { width: 120px; font-size: 13px; font-weight: 600; white-space: nowrap; }
+  .attr-bar-bg { flex: 1; height: 18px; background: var(--surface2); border-radius: 4px; overflow: hidden; }
+  .attr-bar { height: 100%; background: var(--cyan); border-radius: 4px; transition: width 0.3s; }
+  .attr-count { width: 60px; text-align: right; font-size: 13px; font-weight: 600; }
+  .attr-pct { width: 50px; text-align: right; font-size: 12px; color: var(--text-dim); }
+
+  /* Conversion funnel */
+  .funnel-row { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 20px; flex-wrap: wrap; }
+  .funnel-stage { text-align: center; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 28px; min-width: 120px; }
+  .funnel-value { font-size: 28px; font-weight: 700; }
+  .funnel-label { font-size: 11px; text-transform: uppercase; color: var(--text-dim); letter-spacing: 0.5px; margin-top: 4px; }
+  .funnel-arrow { color: var(--text-dim); font-size: 20px; }
+  .funnel-rate { font-size: 12px; color: var(--green); text-align: center; min-width: 50px; }
+
+  /* Error tracking */
+  .error-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .error-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; text-align: center; }
+  .error-card .ec-val { font-size: 24px; font-weight: 700; }
+  .error-card .ec-label { font-size: 11px; text-transform: uppercase; color: var(--text-dim); margin-top: 4px; }
+  .error-list { font-size: 12px; }
+  .error-item { display: flex; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); align-items: center; }
+  .error-item:last-child { border-bottom: none; }
+  .error-time { color: var(--text-dim); width: 70px; flex-shrink: 0; }
+  .error-badge { font-weight: 700; width: 90px; flex-shrink: 0; font-size: 11px; text-transform: uppercase; }
+  .error-badge.e5xx { color: var(--red); }
+  .error-badge.ecrash { color: var(--red); }
+  .error-badge.etimeout { color: var(--yellow); }
+  .error-badge.epay { color: #f97316; }
+  .error-src { color: var(--cyan); width: 120px; flex-shrink: 0; }
+  .error-msg { color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   /* Scrollbar */
   ::-webkit-scrollbar { width: 6px; }
   ::-webkit-scrollbar-track { background: var(--bg); }
@@ -673,6 +707,11 @@ async function fetchAll() {
       const analyticsRes = await fetch(API_BASE + '/analytics?days=7');
       analyticsData = await analyticsRes.json();
     } catch(e) { analyticsData = null; }
+
+    try {
+      const errRes = await fetch(API_BASE + '/analytics/errors?days=7');
+      window._errorData = await errRes.json();
+    } catch(e) { window._errorData = null; }
 
     renderPortfolio();
     renderInsight();
@@ -1607,6 +1646,120 @@ function renderPerformance() {
 }
 
 // ===== ANALYTICS VIEW =====
+function renderAttribution(d) {
+  const refSources = d.attribution?.external_by_referer_source || {};
+  const entries = Object.entries(refSources).sort((a,b) => b[1] - a[1]);
+  if (!entries.length) return '';
+  const maxVal = Math.max(...entries.map(e => e[1]), 1);
+  const total = entries.reduce((s, e) => s + e[1], 0) || 1;
+  const bars = entries.map(([src, count]) => {
+    const pct = ((count / maxVal) * 100).toFixed(0);
+    const share = ((count / total) * 100).toFixed(0);
+    return `<div class="attr-row">
+      <span class="attr-label">${src}</span>
+      <div class="attr-bar-bg"><div class="attr-bar" style="width:${pct}%"></div></div>
+      <span class="attr-count">${count}</span>
+      <span class="attr-pct">${share}%</span>
+    </div>`;
+  }).join('');
+  return `
+    <div class="perf-section-title">Traffic Attribution (External)</div>
+    <div class="attr-section">${bars}</div>
+  `;
+}
+
+function renderFunnel(d) {
+  const f = d.funnel;
+  if (!f || (!f.challenges_402 && !f.payment_succeeded)) return '';
+  const c402 = f.challenges_402 || 0;
+  const paid = f.payment_succeeded || 0;
+  const failed = f.payment_failed || 0;
+  const attempted = paid + failed;
+  const attemptRate = c402 > 0 ? ((attempted / c402) * 100).toFixed(0) : '0';
+  const successRate = attempted > 0 ? ((paid / attempted) * 100).toFixed(0) : '0';
+  return `
+    <div class="perf-section-title">Conversion Funnel</div>
+    <div class="attr-section">
+      <div class="funnel-row">
+        <div class="funnel-stage">
+          <div class="funnel-value" style="color:var(--yellow)">${c402}</div>
+          <div class="funnel-label">402 Challenges</div>
+        </div>
+        <div class="funnel-rate">${attemptRate}% &rarr;</div>
+        <div class="funnel-stage">
+          <div class="funnel-value" style="color:var(--cyan)">${attempted}</div>
+          <div class="funnel-label">Payment Attempts</div>
+        </div>
+        <div class="funnel-rate">${successRate}% &rarr;</div>
+        <div class="funnel-stage">
+          <div class="funnel-value" style="color:var(--green)">${paid}</div>
+          <div class="funnel-label">Paid</div>
+        </div>
+        ${failed > 0 ? `<div class="funnel-stage" style="border-color:var(--red)">
+          <div class="funnel-value" style="color:var(--red)">${failed}</div>
+          <div class="funnel-label">Failed</div>
+        </div>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function renderErrorSummary() {
+  const ed = window._errorData;
+  if (!ed) return '';
+  const api = ed.api_errors || {};
+  const pay = ed.payment_errors || {};
+  const recent = ed.recent_errors || [];
+  const total5xx = api.total_5xx || 0;
+  const total4xx = api.total_4xx || 0;
+  const payFail = pay.total_failures || 0;
+  const errRate = api.error_rate_pct || 0;
+  if (total5xx === 0 && total4xx === 0 && payFail === 0 && recent.length === 0) return '';
+
+  const badgeClass = (t) => {
+    if (t === 'api_5xx') return 'e5xx';
+    if (t === 'agent_crash') return 'ecrash';
+    if (t === 'agent_timeout') return 'etimeout';
+    if (t === 'payment_failure') return 'epay';
+    return '';
+  };
+
+  const recentRows = recent.slice(0, 10).map(e => {
+    const ts = e.timestamp ? new Date(e.timestamp).toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}) : '';
+    return `<div class="error-item">
+      <span class="error-time">${ts}</span>
+      <span class="error-badge ${badgeClass(e.error_type)}">${(e.error_type || '').replace(/_/g, ' ')}</span>
+      <span class="error-src">${e.source || ''}</span>
+      <span class="error-msg">${e.message || ''}</span>
+    </div>`;
+  }).join('');
+
+  return `
+    <div class="perf-section-title">Error Tracking (7d)</div>
+    <div class="attr-section">
+      <div class="error-cards">
+        <div class="error-card">
+          <div class="ec-val" style="color:${total5xx > 0 ? 'var(--red)' : 'var(--green)'}">${total5xx}</div>
+          <div class="ec-label">5xx Errors</div>
+        </div>
+        <div class="error-card">
+          <div class="ec-val" style="color:${total4xx > 0 ? 'var(--yellow)' : 'var(--green)'}">${total4xx}</div>
+          <div class="ec-label">4xx Errors</div>
+        </div>
+        <div class="error-card">
+          <div class="ec-val" style="color:${payFail > 0 ? '#f97316' : 'var(--green)'}">${payFail}</div>
+          <div class="ec-label">Payment Failures</div>
+        </div>
+        <div class="error-card">
+          <div class="ec-val">${errRate}%</div>
+          <div class="ec-label">Error Rate</div>
+        </div>
+      </div>
+      ${recentRows ? '<div class="error-list">' + recentRows + '</div>' : ''}
+    </div>
+  `;
+}
+
 function renderAnalytics() {
   const content = document.getElementById('content');
 
@@ -1760,6 +1913,10 @@ function renderAnalytics() {
         <tbody>${uaRows}</tbody>
       </table>
     ` : ''}
+
+    ${renderAttribution(d)}
+    ${renderFunnel(d)}
+    ${renderErrorSummary()}
 
     <div class="perf-methodology">
       <strong>Discovery Protocols Active:</strong><br>

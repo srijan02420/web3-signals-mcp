@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from typing import Any, Dict, List, Optional
 import logging
 import traceback
@@ -1106,7 +1107,9 @@ class Storage:
                           payment_status: str | None = None,
                           request_source: str = "unknown",
                           referer: str = "",
-                          origin: str = "") -> None:
+                          origin: str = "",
+                          referer_source: str = "",
+                          client_fingerprint: str = "") -> None:
         """Log an API request for analytics.
 
         payment_status: None (not a paid route), 'payment_required' (402),
@@ -1142,18 +1145,23 @@ class Storage:
                     # Migrate: add columns if they don't exist
                     # Use IF NOT EXISTS to avoid aborting the PG transaction
                     for col in ["payment_status TEXT", "request_source TEXT DEFAULT 'unknown'",
-                                "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''"]:
+                                "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''",
+                                "referer_source TEXT DEFAULT ''", "client_fingerprint TEXT DEFAULT ''"]:
                         cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col}")
                     cur.execute(
                         f"CREATE INDEX IF NOT EXISTS idx_{table}_source ON {table} (request_source)"
                     )
                     cur.execute(
+                        f"CREATE INDEX IF NOT EXISTS idx_api_requests_refsrc ON {table} (referer_source)"
+                    )
+                    cur.execute(
                         f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
                         f"status_code, duration_ms, client_ip, payment_status, "
-                        f"request_source, referer, origin) "
-                        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        f"request_source, referer, origin, referer_source, client_fingerprint) "
+                        f"VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (now, endpoint, method, user_agent, status_code, duration_ms,
-                         client_ip, payment_status, request_source, referer, origin),
+                         client_ip, payment_status, request_source, referer, origin,
+                         referer_source, client_fingerprint),
                     )
                 conn.commit()
         else:
@@ -1179,7 +1187,8 @@ class Storage:
                 )
                 # Migrate: add columns if they don't exist
                 for col in ["payment_status TEXT", "request_source TEXT DEFAULT 'unknown'",
-                            "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''"]:
+                            "referer TEXT DEFAULT ''", "origin TEXT DEFAULT ''",
+                            "referer_source TEXT DEFAULT ''", "client_fingerprint TEXT DEFAULT ''"]:
                     try:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
                     except Exception:
@@ -1188,14 +1197,210 @@ class Storage:
                     f"CREATE INDEX IF NOT EXISTS idx_{table}_source ON {table} (request_source)"
                 )
                 conn.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_api_requests_refsrc ON {table} (referer_source)"
+                )
+                conn.execute(
                     f"INSERT INTO {table} (timestamp, endpoint, method, user_agent, "
                     f"status_code, duration_ms, client_ip, payment_status, "
-                    f"request_source, referer, origin) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    f"request_source, referer, origin, referer_source, client_fingerprint) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (now, endpoint, method, user_agent, status_code, duration_ms,
-                     client_ip, payment_status, request_source, referer, origin),
+                     client_ip, payment_status, request_source, referer, origin,
+                     referer_source, client_fingerprint),
                 )
                 conn.commit()
+
+    def save_error_event(self, error_type: str, source: str, message: str,
+                         context: Optional[Dict] = None) -> None:
+        """Log a structured error event for analytics.
+
+        error_type: 'agent_timeout', 'agent_crash', 'api_5xx', 'payment_failure'
+        source: agent name or endpoint path
+        """
+        event = {
+            "error_type": error_type,
+            "source": source,
+            "message": str(message)[:500],
+            "context": context or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            # Use a rolling key so we keep last N errors per type
+            key = f"{error_type}:{source}:{int(time.time())}"
+            self.save_kv_json("error_log", key, event)
+        except Exception:
+            logger.warning("save_error_event failed: %s", traceback.format_exc(limit=1))
+
+    def load_error_summary(self, days: int = 7) -> Dict[str, Any]:
+        """Load error summary from api_requests + error_log kv store."""
+        table = "api_requests"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        result: Dict[str, Any] = {
+            "api_errors": {
+                "total_5xx": 0,
+                "total_4xx": 0,
+                "by_endpoint": {},
+                "by_status_code": {},
+                "error_rate_pct": 0,
+            },
+            "payment_errors": {
+                "total_failures": 0,
+                "failure_rate_pct": 0,
+            },
+            "recent_errors": [],
+        }
+
+        try:
+            if self.backend == "postgres":
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        # Total requests for rate calculation
+                        cur.execute(f"SELECT COUNT(*) FROM {table} WHERE timestamp >= %s", (since,))
+                        total = cur.fetchone()[0] or 1
+
+                        # 5xx errors by endpoint
+                        cur.execute(
+                            f"SELECT endpoint, status_code, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND status_code >= 500 "
+                            f"GROUP BY endpoint, status_code ORDER BY COUNT(*) DESC",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            result["api_errors"]["total_5xx"] += row[2]
+                            result["api_errors"]["by_endpoint"][row[0]] = \
+                                result["api_errors"]["by_endpoint"].get(row[0], 0) + row[2]
+                            sc = str(row[1])
+                            result["api_errors"]["by_status_code"][sc] = \
+                                result["api_errors"]["by_status_code"].get(sc, 0) + row[2]
+
+                        # 4xx errors (excluding 402 which is expected)
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND status_code >= 400 AND status_code < 500 "
+                            f"AND status_code != 402",
+                            (since,),
+                        )
+                        row = cur.fetchone()
+                        result["api_errors"]["total_4xx"] = row[0] if row else 0
+
+                        result["api_errors"]["error_rate_pct"] = round(
+                            (result["api_errors"]["total_5xx"] / total) * 100, 2
+                        )
+
+                        # Payment failures
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status = 'payment_failed'",
+                            (since,),
+                        )
+                        row = cur.fetchone()
+                        result["payment_errors"]["total_failures"] = row[0] if row else 0
+
+                        # Payment failure rate (vs total payment attempts)
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status IN ('paid', 'payment_failed')",
+                            (since,),
+                        )
+                        row = cur.fetchone()
+                        pay_total = row[0] if row else 0
+                        if pay_total > 0:
+                            result["payment_errors"]["failure_rate_pct"] = round(
+                                (result["payment_errors"]["total_failures"] / pay_total) * 100, 2
+                            )
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    total = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE timestamp >= ?", (since,)
+                    ).fetchone()[0] or 1
+
+                    rows = conn.execute(
+                        f"SELECT endpoint, status_code, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND status_code >= 500 "
+                        f"GROUP BY endpoint, status_code ORDER BY COUNT(*) DESC",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        result["api_errors"]["total_5xx"] += row[2]
+                        result["api_errors"]["by_endpoint"][row[0]] = \
+                            result["api_errors"]["by_endpoint"].get(row[0], 0) + row[2]
+                        sc = str(row[1])
+                        result["api_errors"]["by_status_code"][sc] = \
+                            result["api_errors"]["by_status_code"].get(sc, 0) + row[2]
+
+                    row = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND status_code >= 400 AND status_code < 500 "
+                        f"AND status_code != 402",
+                        (since,),
+                    ).fetchone()
+                    result["api_errors"]["total_4xx"] = row[0] if row else 0
+
+                    result["api_errors"]["error_rate_pct"] = round(
+                        (result["api_errors"]["total_5xx"] / total) * 100, 2
+                    )
+
+                    row = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status = 'payment_failed'",
+                        (since,),
+                    ).fetchone()
+                    result["payment_errors"]["total_failures"] = row[0] if row else 0
+
+                    row = conn.execute(
+                        f"SELECT COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status IN ('paid', 'payment_failed')",
+                        (since,),
+                    ).fetchone()
+                    pay_total = row[0] if row else 0
+                    if pay_total > 0:
+                        result["payment_errors"]["failure_rate_pct"] = round(
+                            (result["payment_errors"]["total_failures"] / pay_total) * 100, 2
+                        )
+
+            # Load recent errors from kv_json error_log
+            result["recent_errors"] = self._load_recent_error_events(20)
+
+        except Exception:
+            logger.error("load_error_summary failed: %s", traceback.format_exc(limit=1))
+
+        return result
+
+    def _load_recent_error_events(self, limit: int = 20) -> List[Dict]:
+        """Load recent error events from kv_json store."""
+        events = []
+        try:
+            if self.backend == "postgres":
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT key, value_json FROM kv_json "
+                            "WHERE namespace = 'error_log' "
+                            "ORDER BY id DESC LIMIT %s",
+                            (limit,),
+                        )
+                        for row in cur.fetchall():
+                            try:
+                                events.append(json.loads(row[1]) if isinstance(row[1], str) else row[1])
+                            except Exception:
+                                pass
+            else:
+                with sqlite3.connect(self.db_path) as conn:
+                    rows = conn.execute(
+                        "SELECT key, value_json FROM kv_json "
+                        "WHERE namespace = 'error_log' "
+                        "ORDER BY ROWID DESC LIMIT ?",
+                        (limit,),
+                    ).fetchall()
+                    for row in rows:
+                        try:
+                            events.append(json.loads(row[1]) if isinstance(row[1], str) else row[1])
+                        except Exception:
+                            pass
+        except Exception:
+            logger.warning("_load_recent_error_events failed: %s", traceback.format_exc(limit=1))
+        return events
 
     def load_api_analytics(self, days: int = 7) -> Dict[str, Any]:
         """Load aggregated API usage analytics."""
@@ -1214,6 +1419,13 @@ class Storage:
             "external_unique_ips": 0,
             "external_requests_per_day": {},
             "external_by_client_type": {},
+            "external_by_referer_source": {},
+            "funnel": {
+                "challenges_402": 0,
+                "payment_attempted": 0,
+                "payment_succeeded": 0,
+                "payment_failed": 0,
+            },
         }
 
         if self.backend == "postgres":
@@ -1321,6 +1533,36 @@ class Storage:
                                 result["external_by_client_type"].get(ua_type, 0) + row[1]
                             )
 
+                        # --- Attribution: referer source for external requests ---
+                        cur.execute(
+                            f"SELECT COALESCE(NULLIF(referer_source, ''), 'direct'), COUNT(*) "
+                            f"FROM {table} "
+                            f"WHERE timestamp >= %s AND COALESCE(request_source, 'unknown') = 'external' "
+                            f"GROUP BY COALESCE(NULLIF(referer_source, ''), 'direct') "
+                            f"ORDER BY COUNT(*) DESC",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            result["external_by_referer_source"][row[0]] = row[1]
+
+                        # --- Conversion funnel ---
+                        cur.execute(
+                            f"SELECT payment_status, COUNT(*) FROM {table} "
+                            f"WHERE timestamp >= %s AND payment_status IS NOT NULL "
+                            f"GROUP BY payment_status",
+                            (since,),
+                        )
+                        for row in cur.fetchall():
+                            if row[0] == "payment_required":
+                                result["funnel"]["challenges_402"] = row[1]
+                            elif row[0] == "paid":
+                                result["funnel"]["payment_succeeded"] = row[1]
+                            elif row[0] == "payment_failed":
+                                result["funnel"]["payment_failed"] = row[1]
+                        result["funnel"]["payment_attempted"] = (
+                            result["funnel"]["payment_succeeded"] + result["funnel"]["payment_failed"]
+                        )
+
             except Exception:
                 logger.error("load_api_analytics (postgres) failed: %s", traceback.format_exc(limit=1))
         else:
@@ -1416,6 +1658,36 @@ class Storage:
                         result["external_by_client_type"][ua_type] = (
                             result["external_by_client_type"].get(ua_type, 0) + row[1]
                         )
+
+                    # --- Attribution: referer source for external requests ---
+                    rows = conn.execute(
+                        f"SELECT COALESCE(NULLIF(referer_source, ''), 'direct'), COUNT(*) "
+                        f"FROM {table} "
+                        f"WHERE timestamp >= ? AND COALESCE(request_source, 'unknown') = 'external' "
+                        f"GROUP BY COALESCE(NULLIF(referer_source, ''), 'direct') "
+                        f"ORDER BY COUNT(*) DESC",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        result["external_by_referer_source"][row[0]] = row[1]
+
+                    # --- Conversion funnel ---
+                    rows = conn.execute(
+                        f"SELECT payment_status, COUNT(*) FROM {table} "
+                        f"WHERE timestamp >= ? AND payment_status IS NOT NULL "
+                        f"GROUP BY payment_status",
+                        (since,),
+                    ).fetchall()
+                    for row in rows:
+                        if row[0] == "payment_required":
+                            result["funnel"]["challenges_402"] = row[1]
+                        elif row[0] == "paid":
+                            result["funnel"]["payment_succeeded"] = row[1]
+                        elif row[0] == "payment_failed":
+                            result["funnel"]["payment_failed"] = row[1]
+                    result["funnel"]["payment_attempted"] = (
+                        result["funnel"]["payment_succeeded"] + result["funnel"]["payment_failed"]
+                    )
 
             except Exception:
                 logger.error("load_api_analytics (sqlite) failed: %s", traceback.format_exc(limit=1))

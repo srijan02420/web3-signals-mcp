@@ -315,12 +315,24 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
                 logger.info("  %s: %s (%sms, %s errors)", name, status, ms, errs)
             except concurrent.futures.TimeoutError:
                 logger.error("  %s: TIMEOUT after %ss — skipping", name, agent_timeout)
+                if _store:
+                    _store.save_error_event(
+                        error_type="agent_timeout",
+                        source=name,
+                        message=f"Timeout after {agent_timeout}s",
+                    )
                 # Cancel the future and recreate executor to abandon hung thread
                 future.cancel()
                 _agent_executor.shutdown(wait=False)
                 _agent_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             except Exception as exc:
                 logger.error("  %s: CRASH — %s", name, exc)
+                if _store:
+                    _store.save_error_event(
+                        error_type="agent_crash",
+                        source=name,
+                        message=str(exc)[:500],
+                    )
         _agent_executor.shutdown(wait=False)
 
         # Run signal fusion only if at least one agent produced new data
@@ -743,6 +755,51 @@ def _classify_request_source(request: Request) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Referer source classification — track which directory/listing sent traffic
+# ---------------------------------------------------------------------------
+_REFERER_MAP = {
+    "mcp.so": "mcp.so",
+    "pulsemcp": "pulsemcp",
+    "mcpservers.org": "mcpservers.org",
+    "x402list.fun": "x402list.fun",
+    "bazaar": "bazaar",
+    "glama.ai": "glama.ai",
+    "smithery.ai": "smithery.ai",
+    "mcphub": "mcphub",
+    "mcpmarket": "mcpmarket",
+    "lobehub": "lobehub",
+    "google.com": "google",
+    "bing.com": "bing",
+    "duckduckgo": "duckduckgo",
+    "twitter.com": "twitter",
+    "x.com": "twitter",
+    "reddit.com": "reddit",
+    "linkedin.com": "linkedin",
+    "github.com": "github",
+}
+
+
+def _classify_referer_source(referer: str) -> str:
+    """Classify referer into a known source for attribution tracking."""
+    if not referer:
+        return "direct"
+    ref_lower = referer.lower()
+    if any(host in ref_lower for host in _OWN_HOSTS):
+        return "self"
+    for pattern, label in _REFERER_MAP.items():
+        if pattern in ref_lower:
+            return label
+    return "other"
+
+
+def _make_fingerprint(ip: str, ua: str) -> str:
+    """Create a short hash fingerprint from IP + user-agent for unique client tracking."""
+    import hashlib
+    raw = f"{ip}|{ua}"
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
 # Usage Tracking Middleware
 # ---------------------------------------------------------------------------
 class UsageTrackingMiddleware(BaseHTTPMiddleware):
@@ -800,6 +857,8 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                 request_source = _classify_request_source(request)
                 referer = request.headers.get("referer", "")
                 origin = request.headers.get("origin", "")
+                referer_source = _classify_referer_source(referer)
+                fingerprint = _make_fingerprint(client_ip, ua)
                 _store.save_api_request(
                     endpoint=path,
                     method=request.method,
@@ -811,7 +870,26 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
                     request_source=request_source,
                     referer=referer,
                     origin=origin,
+                    referer_source=referer_source,
+                    client_fingerprint=fingerprint,
                 )
+
+                # Track errors for analytics
+                if status >= 500:
+                    _store.save_error_event(
+                        error_type="api_5xx",
+                        source=path,
+                        message=f"HTTP {status} on {request.method} {path}",
+                        context={"status_code": status, "duration_ms": round(duration_ms, 1),
+                                 "user_agent": ua[:100]}
+                    )
+                if payment_status == "payment_failed":
+                    _store.save_error_event(
+                        error_type="payment_failure",
+                        source=path,
+                        message=f"x402 payment failed on {path}",
+                        context={"user_agent": ua[:100], "duration_ms": round(duration_ms, 1)}
+                    )
         except Exception:
             logger.warning("Usage tracking failed for %s %s: %s",
                            request.method, path, traceback.format_exc(limit=1))
@@ -1394,6 +1472,10 @@ async def get_analytics(days: int = Query(7, ge=1, le=90, description="Number of
             ),
             "detail_endpoint": "/analytics/x402",
         },
+        "attribution": {
+            "external_by_referer_source": stats.get("external_by_referer_source", {}),
+        },
+        "funnel": stats.get("funnel", {}),
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1650,6 +1732,24 @@ async def get_signal_health():
         "narrative_agent": int(os.getenv("AGENT_CADENCE_NARRATIVE_MIN", "60")),
     }
 
+    return result
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/errors — Error tracking dashboard
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/errors", tags=["analytics"])
+async def get_error_analytics(
+    days: int = Query(7, ge=1, le=90),
+):
+    """Error tracking — API errors, payment failures, agent errors."""
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    result = _store.load_error_summary(days=days)
+    result["window_days"] = days
+    result["last_updated"] = datetime.now(timezone.utc).isoformat()
     return result
 
 
