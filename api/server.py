@@ -713,11 +713,14 @@ def _classify_request_source(request: Request) -> str:
     """Classify request as 'internal', 'external', or 'unknown'.
 
     Detection layers (first match wins):
-    1. X-Internal-Key header matches INTERNAL_API_KEY env var -> internal
-    2. Referer from our own domain (dashboard AJAX calls) -> internal
-    3. Dashboard / admin / analytics paths -> internal
-    4. Postman / curl without payment header -> internal
-    5. Everything else -> external
+    1. X-Internal-Key header matches INTERNAL_API_KEY env var  -> internal
+    2. Referer from our own domain (dashboard AJAX calls)      -> internal
+    3. Pure-admin paths (dashboard, analytics, health, admin)   -> internal
+    4. Free /api/* mirror paths (dashboard's free endpoints)    -> internal
+    5. Dev tool user-agents without payment header              -> internal
+    6. Known AI agent / MCP user-agents                        -> external
+    7. Has x402 payment header                                 -> external
+    8. Everything else                                         -> unknown
     """
     # Layer 1: Explicit header (most reliable)
     if _INTERNAL_API_KEY:
@@ -730,28 +733,52 @@ def _classify_request_source(request: Request) -> str:
     if any(host in referer for host in _OWN_HOSTS):
         return "internal"
 
-    # Layer 3: Internal / admin paths (not used by external agents)
+    # Layer 3: Pure admin/ops paths — no external user would hit these
     path = request.url.path
-    if (path.startswith("/api/") or path == "/dashboard"
-            or path.startswith("/analytics") or path == "/health"
-            or path.startswith("/admin") or path.startswith("/.well-known")
-            or path == "/robots.txt" or path == "/docs"
-            or path == "/openapi.json"):
+    if (path == "/dashboard" or path.startswith("/analytics")
+            or path == "/health" or path.startswith("/admin")):
         return "internal"
 
-    # Layer 4: Development tool user-agents (only when NO payment header)
+    # Layer 4: Free /api/* mirror paths — only dashboard calls these
+    if path.startswith("/api/"):
+        return "internal"
+
     ua = (request.headers.get("user-agent", "") or "").lower()
     has_payment = bool(
         request.headers.get("payment-signature", "")
         or request.headers.get("x-payment", "")
     )
 
+    # Layer 5: Dev tools without payment header = testing
     if not has_payment:
-        if "postman" in ua or "curl" in ua:
+        if any(t in ua for t in ("postman", "curl", "httpie", "insomnia")):
             return "internal"
 
-    # Layer 5: Everything else is a real external call
-    return "external"
+    # Layer 6: Known AI agents / bots — always external
+    _AI_AGENT_SIGS = (
+        "claudebot", "claude-web", "anthropic",
+        "gptbot", "chatgpt", "openai",
+        "google-extended", "gemini",
+        "mcp", "langchain", "crewai", "autogpt",
+        "ccbot", "bytespider", "amazonbot",
+    )
+    if any(sig in ua for sig in _AI_AGENT_SIGS):
+        return "external"
+
+    # Layer 7: Has x402 payment header = real paying user
+    if has_payment:
+        return "external"
+
+    # Layer 8: Discovery endpoints from non-dashboard source = external
+    if (path.startswith("/.well-known") or path == "/docs"
+            or path == "/openapi.json" or path == "/robots.txt"
+            or path.startswith("/mcp/")):
+        return "external"
+
+    # Layer 9: Paid endpoints hit without referer/key
+    # Could be us testing OR a real user. Mark unknown so we don't
+    # pollute either bucket — user can audit these later.
+    return "unknown"
 
 
 # ---------------------------------------------------------------------------

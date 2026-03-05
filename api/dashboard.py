@@ -1881,10 +1881,13 @@ function renderAnalytics() {
   const intReqs = bySource.internal || 0;
   const unkReqs = bySource.unknown || 0;
 
-  // Count AI agent requests
+  // Count AI agent requests (from EXTERNAL only — the metric that matters)
   const aiTypes = ['claude', 'openai', 'gemini', 'langchain', 'crewai', 'mcp_client', 'autogpt'];
-  let aiReqs = 0;
-  aiTypes.forEach(t => { aiReqs += (byType[t] || 0); });
+  const extTypes = d.external_by_client_type || {};
+  let extAiReqs = 0;
+  aiTypes.forEach(t => { extAiReqs += (extTypes[t] || 0); });
+  let totalAiReqs = 0;
+  aiTypes.forEach(t => { totalAiReqs += (byType[t] || 0); });
 
   // Summary cards
   const summaryCards = `
@@ -1892,17 +1895,17 @@ function renderAnalytics() {
       <div class="analytics-card">
         <div class="ac-label">Total Requests (7d)</div>
         <div class="ac-value" style="color:var(--cyan)">${totalReqs.toLocaleString()}</div>
-        <div class="ac-sub">${extReqs.toLocaleString()} external &middot; ${intReqs.toLocaleString()} internal${unkReqs > 0 ? ' &middot; ' + unkReqs.toLocaleString() + ' unknown' : ''}</div>
+        <div class="ac-sub">${intReqs.toLocaleString()} internal &middot; ${extReqs.toLocaleString()} external${unkReqs > 0 ? ' &middot; ' + unkReqs.toLocaleString() + ' unclassified' : ''}</div>
       </div>
       <div class="analytics-card">
-        <div class="ac-label">External Requests</div>
+        <div class="ac-label">Confirmed External</div>
         <div class="ac-value" style="color:var(--green)">${extReqs.toLocaleString()}</div>
         <div class="ac-sub">${extClients} unique clients</div>
       </div>
       <div class="analytics-card">
-        <div class="ac-label">AI Agent Requests</div>
-        <div class="ac-value" style="color:var(--purple, #a78bfa)">${aiReqs.toLocaleString()}</div>
-        <div class="ac-sub">${totalReqs > 0 ? ((aiReqs/totalReqs)*100).toFixed(1) : 0}% of total</div>
+        <div class="ac-label">External AI Agents</div>
+        <div class="ac-value" style="color:var(--purple, #a78bfa)">${extAiReqs.toLocaleString()}</div>
+        <div class="ac-sub">${extReqs > 0 ? ((extAiReqs/extReqs)*100).toFixed(0) : 0}% of external traffic</div>
       </div>
       <div class="analytics-card">
         <div class="ac-label">Avg Response</div>
