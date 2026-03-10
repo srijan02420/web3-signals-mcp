@@ -2061,6 +2061,23 @@ async def reset_accuracy(request: Request):
     }
 
 
+@app.post("/admin/trigger-pipeline", tags=["admin"], include_in_schema=False)
+async def trigger_pipeline(request: Request):
+    """Manually trigger the 12h performance pipeline (evaluate + IC)."""
+    if not _ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="ADMIN_TOKEN not configured")
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer ") or auth[7:] != _ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid admin token")
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    pipeline_ok = _run_perf_pipeline(_store)
+    if pipeline_ok:
+        _store.save_kv("perf_pipeline", "last_run", time.time())
+    return {"status": "pipeline triggered", "evaluation_ran": pipeline_ok}
+
+
 # ---------------------------------------------------------------------------
 # A2A Agent Card — /.well-known/agent.json
 # ---------------------------------------------------------------------------
