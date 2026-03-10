@@ -386,8 +386,11 @@ def _orchestrator_loop(store: Storage, interval: int) -> None:
 
             if last_pipeline is None or (now_ts - last_pipeline) >= pipeline_interval * 3600:
                 logger.info("  [PIPELINE] Running unified 12h performance pipeline...")
-                _run_perf_pipeline(store)
-                store.save_kv("perf_pipeline", "last_run", now_ts)
+                pipeline_ok = _run_perf_pipeline(store)
+                if pipeline_ok:
+                    store.save_kv("perf_pipeline", "last_run", now_ts)
+                else:
+                    logger.warning("  [PIPELINE] No prices available — will retry next cycle")
         except Exception as exc:
             logger.error("  performance pipeline: %s", exc)
 
@@ -556,7 +559,7 @@ def _evaluate_old_snapshots(store: Storage) -> dict:
 
     if not current_prices:
         logger.warning("  performance eval: no prices available from market agent (latest or history)")
-        return {"24h": 0, "48h": 0}
+        return None  # Signal that prices were unavailable — caller should retry
 
     # Load gradient scoring config from fusion profile
     accuracy_cfg = {}
@@ -632,8 +635,9 @@ def _evaluate_old_snapshots(store: Storage) -> dict:
     return result
 
 
-def _run_perf_pipeline(store: Storage) -> None:
-    """Unified 12h performance pipeline: snapshot → evaluate → IC → optimize."""
+def _run_perf_pipeline(store: Storage) -> bool:
+    """Unified 12h performance pipeline: snapshot → evaluate → IC → optimize.
+    Returns True if evaluation ran successfully (prices were available)."""
     t0 = time.time()
 
     # Step 1: Save snapshots for all assets
@@ -648,9 +652,10 @@ def _run_perf_pipeline(store: Storage) -> None:
         eval_counts = _evaluate_old_snapshots(store)
     except Exception as eval_exc:
         logger.error("  [PIPELINE] Evaluation error: %s", eval_exc)
-        eval_counts = {}
-    eval_24h = eval_counts.get("24h", 0)
-    eval_48h = eval_counts.get("48h", 0)
+        eval_counts = None
+    eval_ran = eval_counts is not None  # False if no prices were available
+    eval_24h = (eval_counts or {}).get("24h", 0)
+    eval_48h = (eval_counts or {}).get("48h", 0)
 
     # Step 4: Compute IC (Information Coefficient)
     ic_status = "skipped"
@@ -692,6 +697,8 @@ def _run_perf_pipeline(store: Storage) -> None:
         "  [PIPELINE] 12h complete: %s snapshots, %s eval'd (24h), %s eval'd (48h), IC: %s [%.1fs]",
         snapshots_saved, eval_24h, eval_48h, ic_status, elapsed,
     )
+
+    return eval_ran
 
 
 # ---------------------------------------------------------------------------
