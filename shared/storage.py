@@ -1039,6 +1039,245 @@ class Storage:
             "days": days,
         }
 
+    # ------------------------------------------------------------------ #
+    #  Pipeline diagnostics
+    # ------------------------------------------------------------------ #
+
+    def load_pipeline_diagnostics(self, days: int = 30) -> Dict[str, Any]:
+        """Diagnostic view of the snapshot → evaluation → IC pipeline."""
+        snap_table = "performance_snapshots"
+        acc_table = "performance_accuracy"
+        dim_table = "ic_dimension_scores"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+
+        result: Dict[str, Any] = {
+            "snapshots": 0, "evaluations_24h": 0, "evaluations_48h": 0,
+            "dimension_scores_saved": 0, "unevaluated_older_than_24h": 0,
+            "ic_ready_slices": 0, "eval_to_snapshot_ratio": 0,
+        }
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(f"SELECT COUNT(*) FROM {snap_table} WHERE timestamp >= %s", (since,))
+                        result["snapshots"] = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT a.window_hours, COUNT(*) FROM {acc_table} a "
+                            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                            f"WHERE s.timestamp >= %s AND a.gradient_score IS NOT NULL "
+                            f"GROUP BY a.window_hours", (since,))
+                        for row in cur.fetchall():
+                            if row[0] == 24:
+                                result["evaluations_24h"] = row[1]
+                            elif row[0] == 48:
+                                result["evaluations_48h"] = row[1]
+
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {dim_table} "
+                            f"WHERE snapshot_id IN (SELECT id FROM {snap_table} WHERE timestamp >= %s)", (since,))
+                        result["dimension_scores_saved"] = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT COUNT(*) FROM {snap_table} "
+                            f"WHERE evaluated_24h = FALSE AND timestamp <= %s AND timestamp >= %s",
+                            (cutoff_24h, since))
+                        result["unevaluated_older_than_24h"] = (cur.fetchone() or [0])[0]
+
+                        cur.execute(
+                            f"SELECT COUNT(DISTINCT s.timestamp) FROM {snap_table} s "
+                            f"JOIN {acc_table} a ON a.snapshot_id = s.id "
+                            f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                            f"WHERE s.timestamp >= %s AND a.pct_change IS NOT NULL", (since,))
+                        result["ic_ready_slices"] = (cur.fetchone() or [0])[0]
+            except Exception as exc:
+                logger.warning("load_pipeline_diagnostics pg: %s", exc)
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    result["snapshots"] = (conn.execute(
+                        f"SELECT COUNT(*) FROM {snap_table} WHERE timestamp >= ?", (since,)
+                    ).fetchone() or [0])[0]
+
+                    for row in conn.execute(
+                        f"SELECT a.window_hours, COUNT(*) FROM {acc_table} a "
+                        f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                        f"WHERE s.timestamp >= ? AND a.gradient_score IS NOT NULL "
+                        f"GROUP BY a.window_hours", (since,)
+                    ).fetchall():
+                        if row[0] == 24:
+                            result["evaluations_24h"] = row[1]
+                        elif row[0] == 48:
+                            result["evaluations_48h"] = row[1]
+
+                    result["dimension_scores_saved"] = (conn.execute(
+                        f"SELECT COUNT(*) FROM {dim_table} "
+                        f"WHERE snapshot_id IN (SELECT id FROM {snap_table} WHERE timestamp >= ?)", (since,)
+                    ).fetchone() or [0])[0]
+
+                    result["unevaluated_older_than_24h"] = (conn.execute(
+                        f"SELECT COUNT(*) FROM {snap_table} "
+                        f"WHERE evaluated_24h = 0 AND timestamp <= ? AND timestamp >= ?",
+                        (cutoff_24h, since)
+                    ).fetchone() or [0])[0]
+
+                    result["ic_ready_slices"] = (conn.execute(
+                        f"SELECT COUNT(DISTINCT s.timestamp) FROM {snap_table} s "
+                        f"JOIN {acc_table} a ON a.snapshot_id = s.id "
+                        f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                        f"WHERE s.timestamp >= ? AND a.pct_change IS NOT NULL", (since,)
+                    ).fetchone() or [0])[0]
+            except Exception as exc:
+                logger.warning("load_pipeline_diagnostics sqlite: %s", exc)
+
+        total_evals = result["evaluations_24h"] + result["evaluations_48h"]
+        if result["snapshots"] > 0:
+            result["eval_to_snapshot_ratio"] = round(total_evals / result["snapshots"], 3)
+
+        return result
+
+    # ------------------------------------------------------------------ #
+    #  Agent intelligence queries
+    # ------------------------------------------------------------------ #
+
+    def load_agent_intelligence(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Per-agent breakdown for external traffic — grouped by client_fingerprint."""
+        table = "api_requests"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        agents: List[Dict[str, Any]] = []
+
+        q = (
+            f"SELECT client_fingerprint, user_agent, "
+            f"COUNT(*) as total_requests, "
+            f"COUNT(DISTINCT endpoint) as unique_endpoints, "
+            f"MIN(timestamp) as first_seen, MAX(timestamp) as last_seen, "
+            f"SUM(CASE WHEN payment_status='payment_required' THEN 1 ELSE 0 END) as challenges_402, "
+            f"SUM(CASE WHEN payment_status='paid' THEN 1 ELSE 0 END) as paid_calls, "
+            f"SUM(CASE WHEN status_code=200 THEN 1 ELSE 0 END) as successful_calls "
+            f"FROM {table} "
+            f"WHERE timestamp >= {{ph}} AND request_source='external' AND client_fingerprint != '' "
+            f"GROUP BY client_fingerprint, user_agent "
+            f"ORDER BY total_requests DESC LIMIT 50"
+        )
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(q.replace("{ph}", "%s"), (since,))
+                        for r in cur.fetchall():
+                            agents.append({
+                                "fingerprint": r[0], "user_agent": r[1],
+                                "type": _classify_user_agent(r[1]),
+                                "total_requests": r[2], "unique_endpoints": r[3],
+                                "first_seen": str(r[4]), "last_seen": str(r[5]),
+                                "challenges_402": r[6], "paid_calls": r[7],
+                                "successful_calls": r[8],
+                            })
+            except Exception as exc:
+                logger.warning("load_agent_intelligence pg: %s", exc)
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    for r in conn.execute(q.replace("{ph}", "?"), (since,)).fetchall():
+                        agents.append({
+                            "fingerprint": r[0], "user_agent": r[1],
+                            "type": _classify_user_agent(r[1]),
+                            "total_requests": r[2], "unique_endpoints": r[3],
+                            "first_seen": r[4], "last_seen": r[5],
+                            "challenges_402": r[6], "paid_calls": r[7],
+                            "successful_calls": r[8],
+                        })
+            except Exception as exc:
+                logger.warning("load_agent_intelligence sqlite: %s", exc)
+
+        return agents
+
+    def load_weekly_growth(self, weeks: int = 8) -> List[Dict[str, Any]]:
+        """Daily external traffic trend for growth tracking."""
+        table = "api_requests"
+        since = (datetime.now(timezone.utc) - timedelta(weeks=weeks)).isoformat()
+        trend: List[Dict[str, Any]] = []
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT CAST(timestamp AS DATE) as day, "
+                            f"COUNT(*) as total_external, "
+                            f"COUNT(DISTINCT client_fingerprint) as unique_agents "
+                            f"FROM {table} WHERE request_source='external' AND timestamp >= %s "
+                            f"GROUP BY CAST(timestamp AS DATE) ORDER BY day", (since,))
+                        for r in cur.fetchall():
+                            trend.append({"date": str(r[0]), "requests": r[1], "unique_agents": r[2]})
+            except Exception as exc:
+                logger.warning("load_weekly_growth pg: %s", exc)
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    for r in conn.execute(
+                        f"SELECT SUBSTR(timestamp, 1, 10) as day, "
+                        f"COUNT(*) as total_external, "
+                        f"COUNT(DISTINCT client_fingerprint) as unique_agents "
+                        f"FROM {table} WHERE request_source='external' AND timestamp >= ? "
+                        f"GROUP BY SUBSTR(timestamp, 1, 10) ORDER BY day", (since,)
+                    ).fetchall():
+                        trend.append({"date": r[0], "requests": r[1], "unique_agents": r[2]})
+            except Exception as exc:
+                logger.warning("load_weekly_growth sqlite: %s", exc)
+
+        return trend
+
+    def load_402_agent_analysis(self, days: int = 30) -> List[Dict[str, Any]]:
+        """Which external agents received 402 challenges."""
+        table = "api_requests"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        agents: List[Dict[str, Any]] = []
+
+        q = (
+            f"SELECT client_fingerprint, user_agent, "
+            f"COUNT(*) as challenges, "
+            f"MIN(timestamp) as first_seen, MAX(timestamp) as last_seen, "
+            f"COUNT(DISTINCT endpoint) as unique_endpoints "
+            f"FROM {table} "
+            f"WHERE timestamp >= {{ph}} AND payment_status='payment_required' "
+            f"AND request_source='external' "
+            f"GROUP BY client_fingerprint, user_agent "
+            f"ORDER BY challenges DESC LIMIT 20"
+        )
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(q.replace("{ph}", "%s"), (since,))
+                        for r in cur.fetchall():
+                            agents.append({
+                                "fingerprint": r[0], "user_agent": r[1],
+                                "type": _classify_user_agent(r[1]),
+                                "challenges": r[2], "first_seen": str(r[3]),
+                                "last_seen": str(r[4]), "unique_endpoints": r[5],
+                            })
+            except Exception as exc:
+                logger.warning("load_402_agent_analysis pg: %s", exc)
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    for r in conn.execute(q.replace("{ph}", "?"), (since,)).fetchall():
+                        agents.append({
+                            "fingerprint": r[0], "user_agent": r[1],
+                            "type": _classify_user_agent(r[1]),
+                            "challenges": r[2], "first_seen": r[3],
+                            "last_seen": r[4], "unique_endpoints": r[5],
+                        })
+            except Exception as exc:
+                logger.warning("load_402_agent_analysis sqlite: %s", exc)
+
+        return agents
+
     def reset_accuracy_data(self) -> Dict[str, int]:
         """Drop and recreate accuracy table, reset snapshot evaluated flags.
 

@@ -713,6 +713,24 @@ async function fetchAll() {
       window._errorData = await errRes.json();
     } catch(e) { window._errorData = null; }
 
+    // Fetch agent intelligence data (non-blocking)
+    try {
+      const agentsRes = await fetch(API_BASE + '/analytics/agents?days=30');
+      window._agentsData = await agentsRes.json();
+    } catch(e) { window._agentsData = null; }
+
+    // Fetch pipeline health data (non-blocking)
+    try {
+      const pipeRes = await fetch(API_BASE + '/analytics/pipeline-health?days=30');
+      window._pipelineData = await pipeRes.json();
+    } catch(e) { window._pipelineData = null; }
+
+    // Fetch x402 diagnostics (non-blocking)
+    try {
+      const x402Res = await fetch(API_BASE + '/analytics/x402/diagnostics?days=30');
+      window._x402Diag = await x402Res.json();
+    } catch(e) { window._x402Diag = null; }
+
     renderPortfolio();
     renderInsight();
     if (currentView === 'history') {
@@ -1187,6 +1205,54 @@ function renderSignalHealth() {
     html += `</div></div>`;
   }
 
+  // Pipeline Health Diagnostics
+  const pipe = window._pipelineData;
+  if (pipe) {
+    const snapCount = pipe.snapshots || 0;
+    const eval24 = pipe.evaluations_24h || 0;
+    const eval48 = pipe.evaluations_48h || 0;
+    const dimScores = pipe.dimension_scores_saved || 0;
+    const unevalBacklog = pipe.unevaluated_older_than_24h || 0;
+    const icSlices = pipe.ic_ready_slices || 0;
+    const ratio = pipe.eval_to_snapshot_ratio || 0;
+    const bottleneck = pipe.bottleneck;
+    const mktAssets = pipe.market_agent_assets || 0;
+    const lastEval = pipe.last_evaluation_ts ? new Date(pipe.last_evaluation_ts).toLocaleString() : 'Never';
+    const lastSnap = pipe.last_snapshot_ts ? new Date(pipe.last_snapshot_ts).toLocaleString() : 'Never';
+
+    html += `
+    <div style="background:var(--surface); border:1px solid ${bottleneck ? 'rgba(239,68,68,0.3)' : 'var(--border)'}; border-radius:10px; padding:20px; margin-top:24px;">
+      <h3 style="font-size:15px; margin-bottom:16px;">Pipeline Health</h3>
+      ${bottleneck ? `<div style="background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:8px; padding:12px; margin-bottom:16px; font-size:13px; color:var(--red);">
+        <strong>Bottleneck:</strong> ${bottleneck}
+      </div>` : ''}
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(140px,1fr)); gap:12px; margin-bottom:16px;">
+        <div style="background:var(--surface2); border-radius:8px; padding:12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:var(--cyan);">${snapCount}</div>
+          <div style="font-size:11px; color:var(--text-dim);">Snapshots (30d)</div>
+        </div>
+        <div style="text-align:center; padding:12px; font-size:22px; color:var(--text-dim);">&#8594;</div>
+        <div style="background:var(--surface2); border-radius:8px; padding:12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:${eval24+eval48 > 0 ? 'var(--green)' : 'var(--red)'};">${eval24 + eval48}</div>
+          <div style="font-size:11px; color:var(--text-dim);">Evaluated (${eval24}/24h, ${eval48}/48h)</div>
+        </div>
+        <div style="text-align:center; padding:12px; font-size:22px; color:var(--text-dim);">&#8594;</div>
+        <div style="background:var(--surface2); border-radius:8px; padding:12px; text-align:center;">
+          <div style="font-size:22px; font-weight:700; color:${icSlices > 0 ? 'var(--green)' : 'var(--yellow)'};">${icSlices}</div>
+          <div style="font-size:11px; color:var(--text-dim);">IC-Ready Slices</div>
+        </div>
+      </div>
+      <div style="font-size:12px; color:var(--text-dim); line-height:1.8;">
+        Backlog: <strong>${unevalBacklog}</strong> unevaluated snapshots &gt;24h old |
+        Dim scores saved: <strong>${dimScores}</strong> |
+        Eval ratio: <strong>${(ratio * 100).toFixed(1)}%</strong><br>
+        Market agent: <strong>${mktAssets}</strong> assets with prices |
+        Last snapshot: <strong>${lastSnap}</strong> |
+        Last evaluation: <strong>${lastEval}</strong>
+      </div>
+    </div>`;
+  }
+
   document.getElementById('content').innerHTML = html;
 }
 
@@ -1527,8 +1593,8 @@ function renderPerformance() {
       ` : ''}
       <div class="perf-methodology" style="margin-top:20px">
         <strong>Methodology:</strong> Direction is extracted from composite score (&gt;60 = bullish, &lt;40 = bearish, 40-60 = neutral).
-        After 24h/48h, we check if price moved in the predicted direction. Neutral signals are correct if price moved &le;2%.
-        Price source: CoinGecko. Scoring: binary hit/miss. Window: 30-day rolling.
+        After 24h/48h, we compare predicted direction vs actual price movement.
+        Price source: CoinGecko + Binance. Scoring: Gradient (0.0-1.0) based on direction AND magnitude. Window: 30-day rolling.
       </div>
     `;
     return;
@@ -1537,9 +1603,9 @@ function renderPerformance() {
   // Active state — show full reputation data
   const rep = perfData.reputation_score || 0;
   const acc = perfData.accuracy_30d || 0;
-  const evaluated = perfData.signals_evaluated || 0;
-  const correct = perfData.signals_correct || 0;
-  const wrong = perfData.signals_wrong || 0;
+  const evaluated = perfData.directional_signals_evaluated || 0;
+  const avgGradient = perfData.avg_gradient_score || 0;
+  const neutralSkipped = perfData.neutral_signals_skipped || 0;
   const byTf = perfData.by_timeframe || {};
   const byAsset = perfData.by_asset || {};
   const snaps = perfData.snapshots_collected_30d || 0;
@@ -1558,7 +1624,7 @@ function renderPerformance() {
       <div class="perf-tf-card">
         <div class="tf-label">${tf} Accuracy</div>
         <div class="tf-value" style="color:${repColor(d.accuracy)}">${d.accuracy}%</div>
-        <div class="tf-detail">${d.hits}/${d.total} correct</div>
+        <div class="tf-detail">${d.total} evaluated (avg: ${d.avg_gradient ? (d.avg_gradient * 100).toFixed(0) : '—'}%)</div>
       </div>`;
   }).join('');
 
@@ -1610,8 +1676,8 @@ function renderPerformance() {
         <div class="perf-label">Reputation Score</div>
         <div class="perf-sub">
           ${acc}% accuracy over 30 days<br>
-          ${correct} correct / ${wrong} wrong<br>
-          ${evaluated} signals evaluated<br>
+          avg gradient: ${(avgGradient * 100).toFixed(1)}%<br>
+          ${evaluated} directional / ${neutralSkipped} neutral skipped<br>
           ${snaps} snapshots collected
         </div>
       </div>
@@ -1639,8 +1705,9 @@ function renderPerformance() {
 
     <div class="perf-methodology" style="margin-top:20px">
       <strong>Methodology:</strong> Direction is extracted from composite score (&gt;60 = bullish, &lt;40 = bearish, 40-60 = neutral).
-      After 24h/48h, we compare predicted direction vs actual price movement. Neutral signals are correct if price moved &le;2%.
-      <strong>Price source:</strong> CoinGecko. <strong>Scoring:</strong> Binary hit/miss. <strong>Window:</strong> 30-day rolling.
+      After 24h/48h, we compare predicted direction vs actual price movement.
+      <strong>Price source:</strong> CoinGecko + Binance. <strong>Scoring:</strong> Gradient (0.0-1.0) based on direction AND magnitude. <strong>Window:</strong> 30-day rolling.
+      <strong>Scale:</strong> 1.0 = strong correct (&gt;5%), 0.7 = moderate (2-5%), 0.4 = weak correct (&lt;2%), 0.2 = weak wrong, 0.0 = clear wrong.
     </div>
   `;
 }
@@ -1742,20 +1809,16 @@ function renderAttribution(d) {
 function renderFunnel(d) {
   const f = d.funnel;
   if (!f) return '';
-  if (!f.challenges_402 && !f.payment_succeeded && !f.payment_failed) {
-    return `
-      <div class="perf-section-title">x402 Payment Funnel</div>
-      <div class="attr-section"><div style="color:var(--text-dim);font-size:13px;padding:8px 0;">No x402 payment activity in this period. Funnel tracks: 402 challenge &rarr; payment attempt &rarr; paid.</div></div>
-    `;
-  }
   const c402 = f.challenges_402 || 0;
   const paid = f.payment_succeeded || 0;
   const failed = f.payment_failed || 0;
   const attempted = paid + failed;
   const attemptRate = c402 > 0 ? ((attempted / c402) * 100).toFixed(0) : '0';
   const successRate = attempted > 0 ? ((paid / attempted) * 100).toFixed(0) : '0';
-  return `
-    <div class="perf-section-title">Conversion Funnel</div>
+
+  // Funnel visualization
+  let html = `
+    <div class="perf-section-title">x402 Conversion Funnel</div>
     <div class="attr-section">
       <div class="funnel-row">
         <div class="funnel-stage">
@@ -1776,9 +1839,53 @@ function renderFunnel(d) {
           <div class="funnel-value" style="color:var(--red)">${failed}</div>
           <div class="funnel-label">Failed</div>
         </div>` : ''}
-      </div>
-    </div>
-  `;
+      </div>`;
+
+  // 402 agent analysis table
+  const diag = window._x402Diag;
+  if (diag && diag.challenged_agents && diag.challenged_agents.length) {
+    html += `
+      <div style="margin-top:16px;">
+        <div style="font-size:13px; font-weight:600; color:var(--text-dim); margin-bottom:8px;">Who Got 402'd? (${diag.challenged_agents.length} agents)</div>
+        <table style="width:100%; border-collapse:collapse; font-size:12px;">
+          <thead><tr style="border-bottom:1px solid var(--border);">
+            <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Agent</th>
+            <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Type</th>
+            <th style="text-align:center; padding:6px 8px; color:var(--text-dim);">402s</th>
+            <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">First Seen</th>
+            <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Last Seen</th>
+          </tr></thead><tbody>`;
+    for (const a of diag.challenged_agents.slice(0, 10)) {
+      const uaShort = a.user_agent.length > 40 ? a.user_agent.substring(0, 40) + '...' : a.user_agent;
+      const typeColor = ['mcp_client','claude','openai','gemini'].includes(a.type) ? 'var(--green)' : 'var(--text)';
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:6px 8px; font-family:monospace; font-size:11px;" title="${a.user_agent}">${uaShort}</td>
+        <td style="padding:6px 8px; color:${typeColor}; font-weight:600;">${a.type}</td>
+        <td style="text-align:center; padding:6px 8px; font-weight:700; color:var(--yellow);">${a.challenges}</td>
+        <td style="padding:6px 8px; font-size:11px; color:var(--text-dim);">${a.first_seen ? new Date(a.first_seen).toLocaleDateString() : '?'}</td>
+        <td style="padding:6px 8px; font-size:11px; color:var(--text-dim);">${a.last_seen ? new Date(a.last_seen).toLocaleDateString() : '?'}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Why aren't they paying?
+  if (c402 > 0 && paid === 0) {
+    html += `
+      <div style="margin-top:16px; background:rgba(239,191,0,0.05); border:1px solid rgba(239,191,0,0.2); border-radius:8px; padding:12px;">
+        <div style="font-size:13px; font-weight:600; color:var(--yellow); margin-bottom:8px;">Why No Payments Yet?</div>
+        <div style="font-size:12px; color:var(--text-dim); line-height:1.8;">
+          Most MCP clients and AI agents don't support x402 payments yet.<br>
+          &#8226; x402 requires USDC on Base ($0.001/call) + x402 SDK<br>
+          &#8226; Agents need: <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;">pip install x402</code> or <code style="background:var(--surface2);padding:2px 6px;border-radius:4px;">npm install x402</code><br>
+          &#8226; Discovery agents (like MCPScoringEngine) are just evaluating, not consuming data<br>
+          &#8226; Consider: offering a free tier or trial calls to build agent adoption
+        </div>
+      </div>`;
+  }
+
+  html += `</div>`;
+  return html;
 }
 
 function renderErrorSummary() {
@@ -1967,6 +2074,7 @@ function renderAnalytics() {
     ${summaryCards}
 
     ${renderAttribution(d)}
+    ${renderAgentIntelligence()}
     ${renderFunnel(d)}
     ${renderErrorSummary()}
 
@@ -2011,6 +2119,115 @@ function renderAnalytics() {
       SDK (Python, Node.js, curl), browser, or bot. AI agent requests are highlighted in green.
     </div>
   `;
+}
+
+function renderAgentIntelligence() {
+  const ad = window._agentsData;
+  if (!ad) return '';
+
+  const agents = ad.agents || [];
+  const growth = ad.growth || {};
+  const epInterest = ad.endpoint_interest || {};
+
+  // Growth cards
+  const thisW = growth.this_week || 0;
+  const lastW = growth.last_week || 0;
+  const wowPct = growth.wow_change_pct || 0;
+  const wowColor = wowPct > 0 ? 'var(--green)' : wowPct < 0 ? 'var(--red)' : 'var(--text-dim)';
+  const wowArrow = wowPct > 0 ? '&#9650;' : wowPct < 0 ? '&#9660;' : '&#8212;';
+
+  let html = `
+    <div class="perf-section-title">Agent Intelligence (30d)</div>
+    <div class="attr-section">
+      <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:12px; margin-bottom:16px;">
+        <div style="background:var(--surface2); border-radius:8px; padding:14px; text-align:center;">
+          <div style="font-size:24px; font-weight:700; color:var(--cyan);">${thisW}</div>
+          <div style="font-size:11px; color:var(--text-dim);">This Week</div>
+        </div>
+        <div style="background:var(--surface2); border-radius:8px; padding:14px; text-align:center;">
+          <div style="font-size:24px; font-weight:700; color:var(--text-dim);">${lastW}</div>
+          <div style="font-size:11px; color:var(--text-dim);">Last Week</div>
+        </div>
+        <div style="background:var(--surface2); border-radius:8px; padding:14px; text-align:center;">
+          <div style="font-size:24px; font-weight:700; color:${wowColor};">${wowArrow} ${Math.abs(wowPct)}%</div>
+          <div style="font-size:11px; color:var(--text-dim);">Week-over-Week</div>
+        </div>
+        <div style="background:var(--surface2); border-radius:8px; padding:14px; text-align:center;">
+          <div style="font-size:24px; font-weight:700; color:${wowPct >= 25 ? 'var(--green)' : 'var(--yellow)'};">${agents.length}</div>
+          <div style="font-size:11px; color:var(--text-dim);">Unique Agents</div>
+        </div>
+      </div>`;
+
+  // Daily trend mini-chart
+  const trend = growth.daily_trend || [];
+  if (trend.length > 1) {
+    const maxR = Math.max(...trend.map(t => t.requests), 1);
+    html += `<div style="display:flex; align-items:flex-end; gap:2px; height:60px; margin-bottom:16px;">`;
+    for (const t of trend) {
+      const pct = (t.requests / maxR) * 100;
+      html += `<div style="flex:1; background:var(--cyan); opacity:0.7; border-radius:2px 2px 0 0; height:${Math.max(pct, 2)}%;" title="${t.date}: ${t.requests} reqs, ${t.unique_agents} agents"></div>`;
+    }
+    html += `</div>
+      <div style="font-size:10px; color:var(--text-dim); display:flex; justify-content:space-between;">
+        <span>${trend[0]?.date || ''}</span><span>Daily External Requests</span><span>${trend[trend.length-1]?.date || ''}</span>
+      </div>`;
+  }
+
+  // Per-agent table
+  if (agents.length) {
+    const aiTypes = ['claude','openai','gemini','langchain','crewai','mcp_client','autogpt'];
+    html += `
+      <div style="margin-top:16px; font-size:13px; font-weight:600; color:var(--text-dim); margin-bottom:8px;">Per-Agent Breakdown</div>
+      <div style="overflow-x:auto;">
+      <table style="width:100%; border-collapse:collapse; font-size:12px;">
+        <thead><tr style="border-bottom:1px solid var(--border);">
+          <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Agent (UA)</th>
+          <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Type</th>
+          <th style="text-align:center; padding:6px 8px; color:var(--text-dim);">Reqs</th>
+          <th style="text-align:center; padding:6px 8px; color:var(--text-dim);">Endpoints</th>
+          <th style="text-align:center; padding:6px 8px; color:var(--text-dim);">402s</th>
+          <th style="text-align:center; padding:6px 8px; color:var(--text-dim);">Paid</th>
+          <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">First Seen</th>
+          <th style="text-align:left; padding:6px 8px; color:var(--text-dim);">Last Seen</th>
+        </tr></thead><tbody>`;
+    for (const a of agents.slice(0, 20)) {
+      const uaShort = a.user_agent.length > 50 ? a.user_agent.substring(0, 50) + '...' : a.user_agent;
+      const isAI = aiTypes.includes(a.type);
+      const typeColor = isAI ? 'var(--green)' : 'var(--text)';
+      html += `<tr style="border-bottom:1px solid var(--border);">
+        <td style="padding:6px 8px; font-family:monospace; font-size:11px; max-width:300px; word-break:break-all;" title="${a.user_agent}">${uaShort}</td>
+        <td style="padding:6px 8px; color:${typeColor}; font-weight:600; font-size:11px;">${a.type}</td>
+        <td style="text-align:center; padding:6px 8px; font-weight:700;">${a.total_requests}</td>
+        <td style="text-align:center; padding:6px 8px;">${a.unique_endpoints}</td>
+        <td style="text-align:center; padding:6px 8px; color:${a.challenges_402 > 0 ? 'var(--yellow)' : 'var(--text-dim)'};">${a.challenges_402}</td>
+        <td style="text-align:center; padding:6px 8px; color:${a.paid_calls > 0 ? 'var(--green)' : 'var(--text-dim)'};">${a.paid_calls}</td>
+        <td style="padding:6px 8px; font-size:11px; color:var(--text-dim);">${a.first_seen ? new Date(a.first_seen).toLocaleDateString() : '?'}</td>
+        <td style="padding:6px 8px; font-size:11px; color:var(--text-dim);">${a.last_seen ? new Date(a.last_seen).toLocaleDateString() : '?'}</td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+  }
+
+  // Endpoint interest
+  const epEntries = Object.entries(epInterest).sort((a,b) => b[1] - a[1]).slice(0, 10);
+  if (epEntries.length) {
+    const maxEp = epEntries[0][1] || 1;
+    html += `
+      <div style="margin-top:16px; font-size:13px; font-weight:600; color:var(--text-dim); margin-bottom:8px;">What External Agents Want</div>`;
+    for (const [ep, count] of epEntries) {
+      const pct = (count / maxEp) * 100;
+      html += `<div style="display:flex; align-items:center; gap:10px; margin-bottom:4px;">
+        <code style="font-size:12px; min-width:200px;">${ep}</code>
+        <div style="flex:1; background:var(--surface2); border-radius:4px; height:18px; overflow:hidden;">
+          <div style="background:var(--cyan); height:100%; width:${pct}%; border-radius:4px;"></div>
+        </div>
+        <span style="font-size:12px; font-weight:700; min-width:40px; text-align:right;">${count}</span>
+      </div>`;
+    }
+  }
+
+  html += `</div>`;
+  return html;
 }
 
 // Initial load

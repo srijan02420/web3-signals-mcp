@@ -26,7 +26,7 @@ import threading
 import time
 import traceback
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -572,19 +572,32 @@ def _evaluate_old_snapshots(store: Storage) -> None:
     """
     # Get current prices from the market agent's latest run (already in storage)
     market = store.load_latest("market_agent")
-    if not market:
-        logger.warning("  performance eval: no market agent data in storage")
-        return
-
-    per_asset = market.get("data", {}).get("per_asset", {})
+    per_asset = market.get("data", {}).get("per_asset", {}) if market else {}
     current_prices = {}
     for asset, adata in per_asset.items():
         p = adata.get("price")
         if p is not None:
             current_prices[asset] = float(p)
 
+    # Fallback: try recent history if latest run is missing prices
     if not current_prices:
-        logger.warning("  performance eval: no prices in market agent data")
+        try:
+            history = store.load_history("market_agent", limit=5)
+            for entry in (history or []):
+                pa = entry.get("data", {}).get("per_asset", {})
+                for asset, adata in pa.items():
+                    if asset not in current_prices:
+                        p = adata.get("price")
+                        if p is not None:
+                            current_prices[asset] = float(p)
+                if current_prices:
+                    logger.info("  performance eval: using fallback prices from market agent history (%s assets)", len(current_prices))
+                    break
+        except Exception:
+            pass
+
+    if not current_prices:
+        logger.warning("  performance eval: no prices available from market agent (latest or history)")
         return
 
     # Load gradient scoring config from fusion profile
@@ -601,10 +614,14 @@ def _evaluate_old_snapshots(store: Storage) -> None:
         if not snapshots:
             continue
 
+        window_evaluated = 0
+        skipped_no_price = set()
+
         for snap in snapshots:
             asset = snap["asset"]
             price_now = current_prices.get(asset)
             if price_now is None:
+                skipped_no_price.add(asset)
                 continue
 
             price_at_signal = snap["price_at_signal"]
@@ -631,12 +648,22 @@ def _evaluate_old_snapshots(store: Storage) -> None:
                 gradient_score=gradient_score,
                 pct_change=round(pct_change, 2),
             )
+            window_evaluated += 1
             total_evaluated += 1
 
+        if skipped_no_price:
+            logger.warning("  [PERF] %sh window: skipped %s snapshots — no price for: %s",
+                          window_hours, len(skipped_no_price), sorted(skipped_no_price))
+        if window_evaluated:
+            logger.info("  [PERF] %sh window: evaluated %s/%s snapshots",
+                       window_hours, window_evaluated, len(snapshots))
+
     if total_evaluated:
-        logger.info("  [PERF] Evaluated %s snapshots across %s windows", total_evaluated, len(windows))
+        logger.info("  [PERF] Total evaluated: %s snapshots across %s windows (prices available for: %s)",
+                    total_evaluated, len(windows), sorted(current_prices.keys()))
     else:
-        logger.info("  [PERF] No snapshots ready for evaluation yet (need 24h+ age)")
+        logger.info("  [PERF] No snapshots ready for evaluation yet (need 24h+ age, have prices for: %s)",
+                    sorted(current_prices.keys()) if current_prices else "none")
 
 
 # ---------------------------------------------------------------------------
@@ -1463,13 +1490,14 @@ async def get_asset_performance(asset: str):
             detail=f"No accuracy data for '{asset}'. Assets with data: {valid}",
         )
 
-    overall = round(stats["hits"] / stats["total"] * 100, 1) if stats["total"] > 0 else 0
+    overall = round(stats.get("avg_gradient", 0) * 100, 1) if stats["total"] > 0 else 0
 
     return {
         "asset": asset,
         "accuracy_30d": asset_accuracy,
         "overall_accuracy_30d": overall,
         "reputation_score": int(round(overall)),
+        "avg_gradient_score": stats.get("avg_gradient", 0),
         "last_updated": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1751,14 +1779,27 @@ async def get_signal_health():
     change_log = _store.load_kv_json("weight_optimizer", "change_log") or []
     result["change_log"] = change_log[-10:]
 
-    # 6. Config version (from latest fusion result)
+    # 6. Config version, regime, abstain rate (from latest fusion result)
     latest_fusion = _store.load_latest("signal_fusion")
     if latest_fusion:
         meta = latest_fusion.get("meta", {})
+        data = latest_fusion.get("data", {})
         result["config_version"] = meta.get("config_version")
-        result["regime"] = latest_fusion.get("regime")
-        # Count abstain rate
-        signals = latest_fusion.get("signals", {})
+
+        # Regime: extract from nested structure
+        portfolio = data.get("portfolio_summary", {})
+        fg_value = portfolio.get("fear_greed")
+        detected_regime = portfolio.get("detected_regime", "unknown")
+        fg_regime = meta.get("regime_at_generation", "unknown")
+        result["regime"] = {
+            "label": fg_regime,
+            "name": detected_regime,
+            "fear_greed_value": fg_value,
+            "value": fg_value,
+        }
+
+        # Abstain rate: signals are under data.signals
+        signals = data.get("signals", {})
         total = len(signals)
         abstain = sum(1 for s in signals.values()
                       if isinstance(s, dict) and s.get("label") == "ABSTAIN")
@@ -1780,6 +1821,159 @@ async def get_signal_health():
     }
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/pipeline-health — IC pipeline diagnostics
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/pipeline-health", tags=["analytics"])
+async def get_pipeline_health(days: int = Query(30, ge=1, le=90)):
+    """Diagnostic view of the snapshot → evaluation → IC pipeline."""
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    diag = _store.load_pipeline_diagnostics(days=days)
+
+    # Add last evaluation and market agent timestamps
+    last_eval_ts = _store.load_kv("perf_eval", "last_run")
+    last_snap_ts = _store.load_kv("perf_snapshot", "last_run")
+    diag["last_evaluation_ts"] = datetime.fromtimestamp(last_eval_ts, tz=timezone.utc).isoformat() if last_eval_ts else None
+    diag["last_snapshot_ts"] = datetime.fromtimestamp(last_snap_ts, tz=timezone.utc).isoformat() if last_snap_ts else None
+
+    # Check market agent data availability
+    market = _store.load_latest("market_agent")
+    if market:
+        per_asset = market.get("data", {}).get("per_asset", {})
+        diag["market_agent_assets"] = len(per_asset)
+        diag["market_agent_timestamp"] = market.get("timestamp", market.get("meta", {}).get("timestamp"))
+    else:
+        diag["market_agent_assets"] = 0
+        diag["market_agent_timestamp"] = None
+
+    # Cached IC results
+    for wh in [24, 48]:
+        cached = _store.load_kv_json("ic_tracking", f"ic_{wh}h_30d")
+        diag[f"ic_{wh}h_cached"] = {
+            "overall_ic": cached.get("overall_ic"),
+            "total_observations": cached.get("total_observations", 0),
+            "total_slices": cached.get("total_slices", 0),
+        } if cached else None
+
+    # Identify bottleneck
+    if diag["snapshots"] == 0:
+        diag["bottleneck"] = "No snapshots — orchestrator may not be running"
+    elif diag["market_agent_assets"] == 0:
+        diag["bottleneck"] = "Market agent has no price data — evaluations cannot run"
+    elif diag["unevaluated_older_than_24h"] > diag["evaluations_24h"]:
+        diag["bottleneck"] = f"{diag['unevaluated_older_than_24h']} snapshots awaiting evaluation — market agent data gaps"
+    elif diag["evaluations_24h"] > 0 and diag["ic_ready_slices"] == 0:
+        diag["bottleneck"] = "Evaluations exist but no IC-ready slices — dimension scores may be missing"
+    elif diag["ic_ready_slices"] > 0 and not diag.get("ic_24h_cached"):
+        diag["bottleneck"] = "IC-ready slices exist but IC not cached — wait for next evaluation cycle"
+    else:
+        diag["bottleneck"] = None
+
+    diag["window_days"] = days
+    return diag
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/agents — Per-agent intelligence & growth tracking
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/agents", tags=["analytics"])
+async def get_agent_intelligence(days: int = Query(30, ge=1, le=90)):
+    """Per-agent breakdown of external traffic with growth metrics."""
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    agents = _store.load_agent_intelligence(days=days)
+    daily_trend = _store.load_weekly_growth(weeks=8)
+
+    # Compute week-over-week growth
+    from collections import defaultdict
+    weekly = defaultdict(lambda: {"requests": 0, "unique_agents": set()})
+    for day in daily_trend:
+        from datetime import date as date_type
+        d = date_type.fromisoformat(day["date"])
+        week_start = d - timedelta(days=d.weekday())
+        wk = str(week_start)
+        weekly[wk]["requests"] += day["requests"]
+
+    sorted_weeks = sorted(weekly.keys())
+    this_week_reqs = weekly[sorted_weeks[-1]]["requests"] if sorted_weeks else 0
+    last_week_reqs = weekly[sorted_weeks[-2]]["requests"] if len(sorted_weeks) >= 2 else 0
+    wow_pct = round((this_week_reqs - last_week_reqs) / max(last_week_reqs, 1) * 100, 1)
+
+    # Endpoint interest from agents
+    endpoint_interest: dict = {}
+    for agent in agents:
+        for ep in (agent.get("endpoints_visited") or "").split(","):
+            ep = ep.strip()
+            if ep:
+                endpoint_interest[ep] = endpoint_interest.get(ep, 0) + agent["total_requests"]
+
+    # Deduplicate: use per-agent endpoint counts from agent_intelligence
+    ext_analytics = _store.load_api_analytics(days=days)
+    endpoint_interest = ext_analytics.get("external_by_endpoint", {})
+
+    return {
+        "agents": agents,
+        "growth": {
+            "this_week": this_week_reqs,
+            "last_week": last_week_reqs,
+            "wow_change_pct": wow_pct,
+            "daily_trend": daily_trend,
+        },
+        "endpoint_interest": endpoint_interest,
+        "window_days": days,
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# GET /analytics/x402/diagnostics — x402 payment flow diagnostics
+# ---------------------------------------------------------------------------
+
+@app.get("/analytics/x402/diagnostics", tags=["analytics"])
+async def get_x402_diagnostics(days: int = Query(30, ge=1, le=90)):
+    """x402 payment flow diagnostics — who got 402'd, facilitator status."""
+    if not _store:
+        raise HTTPException(status_code=503, detail="Storage not initialized")
+
+    challenged_agents = _store.load_402_agent_analysis(days=days)
+
+    # Check facilitator status
+    facilitator_ok = False
+    facilitator_url = os.getenv("X402_FACILITATOR_URL", "")
+    if _X402_ENABLED:
+        facilitator_ok = True  # It was reachable at boot (line 160-161 disables if not)
+
+    # Count total paid (including internal test payments, all time)
+    x402_stats = _store.load_x402_analytics(days=90)
+
+    return {
+        "x402_enabled": bool(_X402_ENABLED),
+        "facilitator_url": facilitator_url,
+        "facilitator_reachable": facilitator_ok,
+        "pay_to": _PAY_TO or None,
+        "price_usdc": "0.001",
+        "network": "Base mainnet (eip155:8453)",
+        "paid_routes": ["/signal", "/signal/{asset}", "/performance/reputation"],
+        "challenged_agents": challenged_agents,
+        "total_402_challenges_all_time": x402_stats.get("total_402_challenges", 0),
+        "total_paid_all_time": x402_stats.get("total_paid_calls", 0),
+        "revenue_usdc_all_time": x402_stats.get("estimated_revenue_usdc", 0),
+        "payment_headers": ["x-payment", "payment-signature"],
+        "how_to_pay": (
+            "1. GET /signal → receive 402 with payment-required header. "
+            "2. Decode base64 payment-required header to get payment details. "
+            "3. Sign USDC payment using x402 SDK (pip install x402 / npm install x402). "
+            "4. Retry GET /signal with x-payment header containing base64-encoded signed payload."
+        ),
+        "window_days": days,
+    }
 
 
 # ---------------------------------------------------------------------------
