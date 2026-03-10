@@ -590,6 +590,9 @@ def _evaluate_old_snapshots(store: Storage) -> dict:
                 continue
 
             # Calculate gradient score for directional signals
+            if not price_at_signal:
+                skipped_no_price.add(asset)
+                continue
             pct_change = (price_now - price_at_signal) / price_at_signal * 100
             gradient_score = _calculate_gradient_score(direction, pct_change, accuracy_cfg)
 
@@ -627,10 +630,18 @@ def _run_perf_pipeline(store: Storage) -> None:
     t0 = time.time()
 
     # Step 1: Save snapshots for all assets
-    snapshots_saved = _record_performance_snapshot(store)
+    try:
+        snapshots_saved = _record_performance_snapshot(store)
+    except Exception as snap_exc:
+        logger.error("  [PIPELINE] Snapshot error: %s", snap_exc)
+        snapshots_saved = 0
 
     # Step 2-3: Evaluate ALL pending 24h and 48h snapshots
-    eval_counts = _evaluate_old_snapshots(store)
+    try:
+        eval_counts = _evaluate_old_snapshots(store)
+    except Exception as eval_exc:
+        logger.error("  [PIPELINE] Evaluation error: %s", eval_exc)
+        eval_counts = {}
     eval_24h = eval_counts.get("24h", 0)
     eval_48h = eval_counts.get("48h", 0)
 
