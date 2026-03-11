@@ -672,7 +672,20 @@ def _run_perf_pipeline(store: Storage) -> bool:
             logger.error("  [IC] %sh computation error: %s", wh, ic_exc)
             ic_status = "error"
 
-    # Step 5: Weight optimizer
+    # Step 4b: Compute per-asset IC (Level 2)
+    per_asset_status = "skipped"
+    for wh in [24, 48]:
+        try:
+            pa_ic = store.compute_ic_per_asset(window_hours=wh, days=30)
+            if pa_ic.get("n_assets", 0) > 0:
+                store.save_kv_json("ic_tracking", f"ic_per_asset_{wh}h_30d", pa_ic)
+                per_asset_status = "computed"
+                logger.info("  [IC] %sh per-asset IC: %s assets",
+                           wh, pa_ic.get("n_assets", 0))
+        except Exception as pa_exc:
+            logger.error("  [IC] %sh per-asset IC error: %s", wh, pa_exc)
+
+    # Step 5: Weight optimizer (global + per-asset)
     try:
         from shared.profile_loader import load_profile
         from signal_fusion.optimizer import WeightOptimizer
@@ -686,16 +699,36 @@ def _run_perf_pipeline(store: Storage) -> bool:
             logger.info("  [LEARN] Running weight optimization...")
             new_weights = optimizer.compute_and_apply()
             if new_weights:
-                logger.info("  [LEARN] Updated weights: %s", new_weights)
+                logger.info("  [LEARN] Updated global weights: %s", new_weights)
+
+            # Per-asset weight optimization
+            pa_weights = optimizer.compute_per_asset_weights()
+            if pa_weights:
+                logger.info("  [LEARN] Updated per-asset weights for %s assets", len(pa_weights))
             else:
-                logger.info("  [LEARN] Not enough data for optimization yet")
+                logger.info("  [LEARN] Not enough per-asset IC data yet")
+
+            # Track weight impact on accuracy
+            impact = optimizer.track_weight_impact()
+            if impact and impact.get("status") == "tracked":
+                delta = impact.get("overall_delta", 0)
+                improved = impact.get("improved", 0)
+                declined = impact.get("declined", 0)
+                symbol = "+" if delta >= 0 else ""
+                logger.info("  [TRACK] Accuracy delta: %s%.3f | %s improved, %s declined, %s stable",
+                           symbol, delta, improved, declined, impact.get("stable", 0))
+            elif impact and impact.get("status") == "baseline_saved":
+                logger.info("  [TRACK] Baseline accuracy saved (%s assets)", impact.get("n_assets", 0))
+        else:
+            logger.info("  [LEARN] Not enough data for optimization yet")
     except Exception as opt_exc:
         logger.error("  weight optimizer: %s", opt_exc)
 
     elapsed = round(time.time() - t0, 1)
     logger.info(
-        "  [PIPELINE] 12h complete: %s snapshots, %s eval'd (24h), %s eval'd (48h), IC: %s [%.1fs]",
-        snapshots_saved, eval_24h, eval_48h, ic_status, elapsed,
+        "  [PIPELINE] 12h complete: %s snapshots, %s eval'd (24h), %s eval'd (48h), "
+        "IC: %s, per-asset: %s [%.1fs]",
+        snapshots_saved, eval_24h, eval_48h, ic_status, per_asset_status, elapsed,
     )
 
     return eval_ran

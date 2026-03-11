@@ -265,6 +265,237 @@ class WeightOptimizer:
         })
 
     # ------------------------------------------------------------------ #
+    #  Per-asset weight optimization (Level 2)
+    # ------------------------------------------------------------------ #
+
+    def compute_per_asset_weights(self) -> Optional[Dict[str, Dict[str, float]]]:
+        """Compute per-asset weight profiles from per-asset IC data.
+
+        For each asset with enough IC data, generates a custom weight profile.
+        Assets without enough data fall back to global learned weights.
+
+        Returns {BTC: {whale: 0.15, technical: 0.10, ...}, ETH: {...}, ...}
+        or None if no per-asset IC data is available.
+        """
+        if not self.enabled:
+            return None
+
+        # Load per-asset IC (try 24h first, then 48h)
+        pa_ic_data = None
+        for window in ["ic_per_asset_24h_30d", "ic_per_asset_48h_30d"]:
+            data = self.store.load_kv_json("ic_tracking", window)
+            if data and data.get("assets"):
+                pa_ic_data = data
+                break
+
+        if not pa_ic_data:
+            return None
+
+        assets = pa_ic_data.get("assets", {})
+        if not assets:
+            return None
+
+        min_obs = int(self.cfg.get("min_per_asset_observations", 8))
+        promote_thresh = float(self.cfg.get("ic_promote_threshold", 0.03))
+        demote_thresh = float(self.cfg.get("ic_demote_threshold", 0.01))
+        disable_thresh = float(self.cfg.get("ic_disable_threshold", -0.02))
+        promote_boost = float(self.cfg.get("promote_boost", 1.3))
+        demote_factor = float(self.cfg.get("demote_factor", 0.5))
+        disable_factor = float(self.cfg.get("disable_factor", 0.15))
+        min_weight = float(self.cfg.get("min_weight", 0.05))
+        max_weight = float(self.cfg.get("max_weight", 0.40))
+        fallback = self.cfg.get("fallback_weights", {})
+
+        per_asset_weights: Dict[str, Dict[str, float]] = {}
+        per_asset_reasons: Dict[str, Dict[str, str]] = {}
+
+        for asset, asset_ic in assets.items():
+            n_obs = asset_ic.get("n_observations", 0)
+            if n_obs < min_obs:
+                continue
+
+            dims = asset_ic.get("dimensions", {})
+            raw_weights: Dict[str, float] = {}
+            reasons: Dict[str, str] = {}
+
+            for role in self.all_roles:
+                base_w = float(fallback.get(role, 0.17))
+                dim_ic = dims.get(role, {})
+                ic_val = dim_ic.get("ic")
+                n = dim_ic.get("n", 0)
+
+                if ic_val is None or n < 5:
+                    raw_weights[role] = base_w
+                    reasons[role] = f"insufficient ({n} obs) → fallback"
+                    continue
+
+                if ic_val >= promote_thresh:
+                    weight = base_w * promote_boost
+                    reasons[role] = f"PROMOTE IC={ic_val:.3f}"
+                elif ic_val >= demote_thresh:
+                    weight = base_w
+                    reasons[role] = f"HOLD IC={ic_val:.3f}"
+                elif ic_val >= disable_thresh:
+                    weight = base_w * demote_factor
+                    reasons[role] = f"DEMOTE IC={ic_val:.3f}"
+                else:
+                    weight = base_w * disable_factor
+                    reasons[role] = f"DISABLE IC={ic_val:.3f}"
+
+                raw_weights[role] = weight
+
+            bounded = self._apply_bounds(raw_weights, min_weight, max_weight)
+            per_asset_weights[asset] = bounded
+            per_asset_reasons[asset] = reasons
+
+        if not per_asset_weights:
+            return None
+
+        # EMA blend with previous per-asset weights
+        prev_data = self.store.load_kv_json(self.namespace, "per_asset_weights")
+        prev_weights = prev_data.get("weights", {}) if prev_data else {}
+        learning_rate = float(self.cfg.get("learning_rate", 0.3))
+
+        blended_all: Dict[str, Dict[str, float]] = {}
+        for asset, new_w in per_asset_weights.items():
+            prev_w = prev_weights.get(asset, {})
+            if prev_w:
+                blended: Dict[str, float] = {}
+                for role in self.all_roles:
+                    old = float(prev_w.get(role, new_w.get(role, 0.17)))
+                    blended[role] = round(learning_rate * new_w[role] + (1 - learning_rate) * old, 4)
+                total = sum(blended.values())
+                if total > 0:
+                    for role in self.all_roles:
+                        blended[role] = round(blended[role] / total, 4)
+                diff = 1.0 - sum(blended.values())
+                if abs(diff) > 0.0001:
+                    max_role = max(blended, key=blended.get)
+                    blended[max_role] = round(blended[max_role] + diff, 4)
+                blended_all[asset] = blended
+            else:
+                blended_all[asset] = new_w
+
+        # Save
+        self.store.save_kv_json(self.namespace, "per_asset_weights", {
+            "weights": blended_all,
+            "reasons": per_asset_reasons,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "n_assets": len(blended_all),
+        })
+
+        # Log summary
+        for asset, w in blended_all.items():
+            top = sorted(w.items(), key=lambda x: x[1], reverse=True)[:2]
+            bot = sorted(w.items(), key=lambda x: x[1])[:1]
+            logger.info(
+                "  [LEARN] %s: top=%s(%.2f),%s(%.2f) bottom=%s(%.2f)",
+                asset, top[0][0], top[0][1], top[1][0], top[1][1],
+                bot[0][0], bot[0][1],
+            )
+
+        return blended_all
+
+    def get_per_asset_weights(self) -> Optional[Dict[str, Dict[str, float]]]:
+        """Load the most recently optimized per-asset weights."""
+        data = self.store.load_kv_json(self.namespace, "per_asset_weights")
+        if data and "weights" in data:
+            return data["weights"]
+        return None
+
+    # ------------------------------------------------------------------ #
+    #  Weight impact tracking
+    # ------------------------------------------------------------------ #
+
+    def track_weight_impact(self) -> Optional[Dict[str, Any]]:
+        """Compare current accuracy against baseline to measure optimization impact.
+
+        On first call: saves current accuracy as baseline.
+        On subsequent calls: computes delta (current - baseline) per asset and overall.
+
+        Returns {overall_delta, per_asset: {BTC: {before, after, delta}, ...}} or None.
+        """
+        if not self.enabled:
+            return None
+
+        # Get current accuracy per asset
+        accuracy = self.store.compute_accuracy_by_asset(window_hours=24, days=7)
+        if not accuracy:
+            return None
+
+        baseline = self.store.load_kv_json(self.namespace, "accuracy_baseline")
+
+        if not baseline or not baseline.get("assets"):
+            # First run: save baseline and return
+            self.store.save_kv_json(self.namespace, "accuracy_baseline", {
+                "assets": accuracy,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "note": "pre-optimization baseline",
+            })
+            logger.info("  [TRACK] Saved accuracy baseline for %s assets", len(accuracy))
+            return {"status": "baseline_saved", "n_assets": len(accuracy)}
+
+        # Compare current vs baseline
+        baseline_assets = baseline.get("assets", {})
+        comparisons: Dict[str, Dict] = {}
+        deltas = []
+
+        for asset, current in accuracy.items():
+            prev = baseline_assets.get(asset)
+            if prev and prev.get("n", 0) >= 3 and current.get("n", 0) >= 3:
+                before_grad = prev["avg_gradient"]
+                after_grad = current["avg_gradient"]
+                delta = round(after_grad - before_grad, 4)
+                deltas.append(delta)
+                comparisons[asset] = {
+                    "before": before_grad,
+                    "after": after_grad,
+                    "delta": delta,
+                    "direction": "improved" if delta > 0.02 else ("declined" if delta < -0.02 else "stable"),
+                    "n_before": prev["n"],
+                    "n_after": current["n"],
+                }
+
+        if not deltas:
+            return {"status": "insufficient_data"}
+
+        overall_delta = round(sum(deltas) / len(deltas), 4)
+        improved = sum(1 for d in deltas if d > 0.02)
+        declined = sum(1 for d in deltas if d < -0.02)
+        stable = len(deltas) - improved - declined
+
+        result = {
+            "status": "tracked",
+            "overall_delta": overall_delta,
+            "improved": improved,
+            "declined": declined,
+            "stable": stable,
+            "per_asset": comparisons,
+            "measured_at": datetime.now(timezone.utc).isoformat(),
+            "baseline_from": baseline.get("saved_at"),
+        }
+
+        # Save tracking history (keep last 20)
+        history = self.store.load_kv_json(self.namespace, "impact_history") or []
+        if not isinstance(history, list):
+            history = []
+        history.append(result)
+        history = history[-20:]
+        self.store.save_kv_json(self.namespace, "impact_history", history)
+
+        # If enough data and things improved, update the baseline
+        total_current_evals = sum(a.get("n", 0) for a in accuracy.values())
+        if total_current_evals >= 50 and overall_delta > 0:
+            self.store.save_kv_json(self.namespace, "accuracy_baseline", {
+                "assets": accuracy,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "note": f"updated: +{overall_delta:.3f} overall (from {baseline.get('saved_at', '?')})",
+            })
+            logger.info("  [TRACK] Updated baseline (overall improved by %.3f)", overall_delta)
+
+        return result
+
+    # ------------------------------------------------------------------ #
     #  Accuracy-based fallback (Phase 1, for when IC data is unavailable)
     # ------------------------------------------------------------------ #
 

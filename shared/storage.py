@@ -1040,6 +1040,214 @@ class Storage:
         }
 
     # ------------------------------------------------------------------ #
+    #  Per-asset IC (Level 2)
+    # ------------------------------------------------------------------ #
+
+    def compute_ic_per_asset(self, window_hours: int = 24, days: int = 30,
+                              min_observations: int = 8) -> Dict[str, Any]:
+        """Compute per-asset IC: time-series Spearman correlation per crypto.
+
+        Unlike cross-sectional IC (which ranks assets against each other at
+        each timestamp), this computes IC **per asset over time**: for BTC
+        specifically, does the market dimension predict BTC's future return?
+
+        Returns {assets: {BTC: {dimensions: {market: {ic, n}, ...}}, ...}}.
+        """
+        snap_table = "performance_snapshots"
+        acc_table = "performance_accuracy"
+        dim_table = "ic_dimension_scores"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        rows = []
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT s.asset, s.timestamp, s.signal_score, "
+                            f"a.pct_change, d.dimension_scores "
+                            f"FROM {acc_table} a "
+                            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                            f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                            f"WHERE s.timestamp >= %s "
+                            f"AND a.window_hours = %s "
+                            f"AND a.pct_change IS NOT NULL "
+                            f"ORDER BY s.asset, s.timestamp ASC",
+                            (since, window_hours),
+                        )
+                        rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("compute_ic_per_asset postgres error: %s", e)
+                return {"error": str(e), "assets": {}}
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    rows = conn.execute(
+                        f"SELECT s.asset, s.timestamp, s.signal_score, "
+                        f"a.pct_change, d.dimension_scores "
+                        f"FROM {acc_table} a "
+                        f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                        f"JOIN {dim_table} d ON d.snapshot_id = s.id "
+                        f"WHERE s.timestamp >= ? "
+                        f"AND a.window_hours = ? "
+                        f"AND a.pct_change IS NOT NULL "
+                        f"ORDER BY s.asset, s.timestamp ASC",
+                        (since, window_hours),
+                    ).fetchall()
+            except Exception as e:
+                logger.warning("compute_ic_per_asset sqlite error: %s", e)
+                return {"error": str(e), "assets": {}}
+
+        if not rows:
+            return {"assets": {}, "total_observations": 0,
+                    "window_hours": window_hours, "days": days}
+
+        # Group rows by asset
+        from collections import defaultdict
+        asset_data: Dict[str, list] = defaultdict(list)
+        for r in rows:
+            dim_scores = json.loads(r[4]) if isinstance(r[4], str) else r[4]
+            asset_data[r[0]].append({
+                "timestamp": r[1],
+                "composite": r[2],
+                "pct_change": r[3],
+                "dimensions": dim_scores,
+            })
+
+        # Discover all dimension names
+        all_dimensions: set = set()
+        for obs_list in asset_data.values():
+            for obs in obs_list:
+                all_dimensions.update(obs["dimensions"].keys())
+
+        # Compute time-series IC per asset per dimension
+        result_assets: Dict[str, Dict] = {}
+        for asset, observations in asset_data.items():
+            if len(observations) < min_observations:
+                continue
+
+            returns = [obs["pct_change"] for obs in observations]
+            dims_ic: Dict[str, Dict] = {}
+
+            for dim in sorted(all_dimensions):
+                # Extract (dim_score, return) pairs where dim exists
+                pairs = [(obs["dimensions"][dim], obs["pct_change"])
+                         for obs in observations if dim in obs["dimensions"]]
+                if len(pairs) < min_observations:
+                    continue
+                scores = [p[0] for p in pairs]
+                rets = [p[1] for p in pairs]
+                sr = _rank_array(scores)
+                rr = _rank_array(rets)
+                ic = _pearson(sr, rr)
+                if ic is not None:
+                    dims_ic[dim] = {"ic": round(ic, 4), "n": len(pairs)}
+
+            # Composite IC
+            composites = [obs["composite"] for obs in observations]
+            sr = _rank_array(composites)
+            rr = _rank_array(returns)
+            composite_ic = _pearson(sr, rr)
+
+            result_assets[asset] = {
+                "dimensions": dims_ic,
+                "composite_ic": round(composite_ic, 4) if composite_ic is not None else None,
+                "n_observations": len(observations),
+            }
+
+        return {
+            "assets": result_assets,
+            "total_observations": len(rows),
+            "n_assets": len(result_assets),
+            "window_hours": window_hours,
+            "days": days,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Per-asset accuracy stats (for weight impact tracking)
+    # ------------------------------------------------------------------ #
+
+    def compute_accuracy_by_asset(self, window_hours: int = 24,
+                                   days: int = 7) -> Dict[str, Dict[str, Any]]:
+        """Compute per-asset accuracy stats for recent evaluations.
+
+        Returns {BTC: {avg_gradient: 0.65, directional_accuracy: 0.72, n: 15}, ...}
+        """
+        snap_table = "performance_snapshots"
+        acc_table = "performance_accuracy"
+        since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        rows = []
+        query_params = (since, window_hours)
+        sql = (
+            f"SELECT s.asset, a.gradient_score, a.pct_change, s.signal_direction "
+            f"FROM {acc_table} a "
+            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+            f"WHERE s.timestamp >= {{}} "
+            f"AND a.window_hours = {{}} "
+            f"AND a.gradient_score IS NOT NULL"
+        )
+
+        if self.backend == "postgres":
+            try:
+                with _pg_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            f"SELECT s.asset, a.gradient_score, a.pct_change, s.signal_direction "
+                            f"FROM {acc_table} a "
+                            f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                            f"WHERE s.timestamp >= %s "
+                            f"AND a.window_hours = %s "
+                            f"AND a.gradient_score IS NOT NULL",
+                            query_params,
+                        )
+                        rows = cur.fetchall()
+            except Exception as e:
+                logger.warning("compute_accuracy_by_asset pg error: %s", e)
+                return {}
+        else:
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    rows = conn.execute(
+                        f"SELECT s.asset, a.gradient_score, a.pct_change, s.signal_direction "
+                        f"FROM {acc_table} a "
+                        f"JOIN {snap_table} s ON a.snapshot_id = s.id "
+                        f"WHERE s.timestamp >= ? "
+                        f"AND a.window_hours = ? "
+                        f"AND a.gradient_score IS NOT NULL",
+                        query_params,
+                    ).fetchall()
+            except Exception as e:
+                logger.warning("compute_accuracy_by_asset sqlite error: %s", e)
+                return {}
+
+        if not rows:
+            return {}
+
+        from collections import defaultdict
+        asset_stats: Dict[str, list] = defaultdict(list)
+        for r in rows:
+            asset_stats[r[0]].append({
+                "gradient": r[1],
+                "pct_change": r[2],
+                "direction": r[3],
+            })
+
+        result: Dict[str, Dict[str, Any]] = {}
+        for asset, evals in asset_stats.items():
+            gradients = [e["gradient"] for e in evals]
+            avg_grad = sum(gradients) / len(gradients) if gradients else 0
+            # Directional accuracy: gradient >= 0.5 means correct direction
+            correct = sum(1 for g in gradients if g >= 0.5)
+            dir_acc = correct / len(gradients) if gradients else 0
+            result[asset] = {
+                "avg_gradient": round(avg_grad, 4),
+                "directional_accuracy": round(dir_acc, 4),
+                "n": len(evals),
+            }
+        return result
+
+    # ------------------------------------------------------------------ #
     #  Pipeline diagnostics
     # ------------------------------------------------------------------ #
 

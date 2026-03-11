@@ -80,6 +80,7 @@ class SignalFusion:
 
         # Self-learning optimizer can override the default set
         learning_cfg = self.profile.get("learning", {})
+        per_asset_learned: Optional[Dict[str, Dict[str, float]]] = None
         if learning_cfg.get("enabled", False):
             try:
                 from signal_fusion.optimizer import WeightOptimizer
@@ -92,6 +93,10 @@ class SignalFusion:
                         weights_bullish = learned
                         weights_bearish = learned
                     errors.append(f"using learned weights: {learned}")
+                # Load per-asset weights (Level 2)
+                per_asset_learned = optimizer.get_per_asset_weights()
+                if per_asset_learned:
+                    errors.append(f"per-asset weights: {len(per_asset_learned)} assets")
             except Exception as exc:
                 errors.append(f"optimizer load failed: {exc}")
 
@@ -319,6 +324,13 @@ class SignalFusion:
             else:
                 weights = weights_default
 
+            # Per-asset weight override (Level 2): if we have IC-learned
+            # weights specifically for this asset, use those instead
+            using_per_asset = False
+            if per_asset_learned and asset in per_asset_learned:
+                weights = per_asset_learned[asset]
+                using_per_asset = True
+
             base_weights: Dict[str, float] = {}
             for role in all_roles:
                 base_weights[role] = float(weights.get(role, 0.0))
@@ -509,6 +521,7 @@ class SignalFusion:
                 "velocity": velocity_result if velocity_result else None,
                 "config_version": self.config_hash,
                 "regime_at_generation": _fg_regime(fg_value),
+                "per_asset_weights": using_per_asset,
             }
 
             # Store current score for next momentum comparison
