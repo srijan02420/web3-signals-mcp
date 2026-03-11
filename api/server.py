@@ -1832,20 +1832,33 @@ async def get_signal_health():
             result[f"ic_{wh}h"] = None
 
     # 2. Current weights (from optimizer)
-    learned = _store.load_kv_json("weight_optimizer", "learned_weights")
+    learned = _store.load_kv_json("learning_optimizer", "learned_weights")
     result["weights"] = learned
 
+    # 2b. Per-asset weights
+    pa_weights = _store.load_kv_json("learning_optimizer", "per_asset_weights")
+    result["per_asset_weights"] = pa_weights
+
+    # 2c. Per-asset IC
+    for wh in [24, 48]:
+        pa_ic = _store.load_kv_json("ic_tracking", f"ic_per_asset_{wh}h_30d")
+        result[f"ic_per_asset_{wh}h"] = pa_ic
+
     # 3. Optimizer state
-    opt_state = _store.load_kv_json("weight_optimizer", "optimizer_state")
+    opt_state = _store.load_kv_json("learning_optimizer", "optimizer_state")
     result["optimizer_state"] = opt_state
 
     # 4. Decay alerts
-    decay = _store.load_kv_json("weight_optimizer", "decay_alerts")
+    decay = _store.load_kv_json("learning_optimizer", "decay_alerts")
     result["decay_alerts"] = decay
 
     # 5. Change log (last 10 entries)
-    change_log = _store.load_kv_json("weight_optimizer", "change_log") or []
+    change_log = _store.load_kv_json("learning_optimizer", "change_log") or []
     result["change_log"] = change_log[-10:]
+
+    # 5b. Accuracy impact tracking
+    impact = _store.load_kv_json("learning_optimizer", "weight_impact_history")
+    result["weight_impact"] = impact
 
     # 6. Config version, regime, abstain rate (from latest fusion result)
     latest_fusion = _store.load_latest("signal_fusion")
