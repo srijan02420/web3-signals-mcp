@@ -88,22 +88,9 @@ def _get_fusion() -> SignalFusion:
 # ---------------------------------------------------------------------------
 # Tool: get_market_briefing — Executive summary with actionable intelligence
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_market_briefing() -> str:
-    """
-    Executive market briefing — human-friendly summary of current market conditions.
-
-    Returns a structured briefing with:
-    - Market regime (trending/ranging) and overall risk level
-    - Top 3 strongest buy signals with scores and key drivers
-    - Top 3 strongest sell signals with scores and key drivers
-    - Regime context (what the current regime means for trading)
-    - Data freshness and confidence assessment
-    - High-conviction calls (signals outside the 38-62 abstain zone)
-
-    This is the best starting point for understanding current market conditions.
-    For raw data, use get_all_signals instead.
-    """
+    """Get executive market intelligence briefing with top buy/sell signals and regime context. Returns market regime (TRENDING/RANGING), risk level, top 3 bullish and bearish signals ranked by composite score, high-conviction positions outside the 38-62 abstain zone, and regime-specific trading context. Best starting point for portfolio decisions. For raw per-asset data, use get_all_signals."""
     fusion = _get_fusion()
     result = fusion.fuse()
 
@@ -190,20 +177,9 @@ def get_market_briefing() -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_all_signals
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_all_signals() -> str:
-    """
-    Get scored signals for all 20 crypto assets.
-
-    Returns portfolio summary (top buys, top sells, market regime, risk level),
-    composite scores for each asset (0-100), dimension breakdowns (whale, technical,
-    derivatives, narrative, market), momentum tracking, and LLM-generated insights.
-
-    Assets covered: BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOT, MATIC, LINK,
-    UNI, ATOM, LTC, FIL, NEAR, APT, ARB, OP, INJ, SUI.
-
-    Data refreshes every 15 minutes from 5 AI data collection agents.
-    """
+    """Export complete signal fusion for all 20 crypto assets (BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOT, MATIC, LINK, UNI, ATOM, LTC, FIL, NEAR, APT, ARB, OP, INJ, SUI). Returns portfolio_summary (regime, risk, top_buys, top_sells), per-asset composite_score (0-100) with 6-dimension breakdown (whale/technical/derivatives/narrative/market/trend), momentum deltas, and LLM cross-dimensional insights. Refreshes every 15 minutes. Use get_asset_signal for single-asset queries."""
     fusion = _get_fusion()
     result = fusion.fuse()
     return json.dumps(result, indent=2)
@@ -219,21 +195,9 @@ VALID_ASSETS = [
 ]
 
 
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_asset_signal(asset: str) -> str:
-    """
-    Get the signal for a specific crypto asset.
-
-    Args:
-        asset: The crypto asset ticker (e.g. BTC, ETH, SOL). Case-insensitive.
-
-    Returns the composite score (0-100), label (STRONG BUY to STRONG SELL),
-    dimension scores (whale, technical, derivatives, narrative, market),
-    momentum vs previous run, and LLM insight if available.
-
-    Valid assets: BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOT, MATIC, LINK,
-    UNI, ATOM, LTC, FIL, NEAR, APT, ARB, OP, INJ, SUI.
-    """
+    """Get composite signal for a single cryptocurrency. Takes one ticker (case-insensitive) and returns composite_score (0-100), direction label (STRONG BUY to STRONG SELL), all 6 dimension scores with labels, momentum vs previous cycle, and market context (regime/risk). Valid: BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOT, MATIC, LINK, UNI, ATOM, LTC, FIL, NEAR, APT, ARB, OP, INJ, SUI. Invalid tickers return error with valid list."""
     asset = asset.upper().strip()
     if asset not in VALID_ASSETS:
         return json.dumps({
@@ -262,20 +226,9 @@ def get_asset_signal(asset: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: compare_assets — Side-by-side comparison
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def compare_assets(assets: str) -> str:
-    """
-    Compare 2-5 crypto assets side-by-side.
-
-    Args:
-        assets: Comma-separated asset tickers (e.g. "BTC,ETH,SOL"). 2-5 assets.
-
-    Returns a comparison table with composite scores, direction, all 6 dimension
-    scores, momentum, and relative ranking. Useful for portfolio allocation
-    decisions or identifying the strongest/weakest assets in a group.
-
-    Example: compare_assets("BTC,ETH,SOL")
-    """
+    """Rank and compare 2-5 crypto assets side-by-side. Input: comma-separated tickers (e.g. "BTC,ETH,SOL"). Returns ranked comparison with composite_score, direction, all 6 dimensions, momentum, and verdict (strongest/weakest). Sorted by score descending. Use for portfolio rebalancing or multi-asset conviction comparison. Constraints: 2-5 assets; invalid tickers return error with valid list."""
     asset_list = [a.strip().upper() for a in assets.split(",") if a.strip()]
     if len(asset_list) < 2:
         return json.dumps({"error": "Need at least 2 assets to compare. Example: 'BTC,ETH,SOL'"})
@@ -337,15 +290,9 @@ def compare_assets(assets: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_health
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_health() -> str:
-    """
-    Check the health and status of all signal agents.
-
-    Returns the status of each agent (technical, derivatives, market,
-    narrative, whale), when they last ran, duration, error counts,
-    fusion status, and storage backend info.
-    """
+    """Check real-time health of all 5 signal agents and fusion pipeline. Returns per-agent (whale, technical, derivatives, narrative, market) status, last_run timestamp, duration_ms, error count, plus fusion status and storage backend type. Use to diagnose pipeline issues, verify data freshness, or detect stuck agents."""
     store = _get_store()
     agent_names = [
         "technical_agent", "derivatives_agent", "market_agent",
@@ -382,15 +329,9 @@ def get_health() -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_performance
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_performance() -> str:
-    """
-    Get signal reputation and accuracy tracking — rolling 30-day performance.
-
-    Shows overall accuracy percentage across 24h/48h timeframes,
-    per-asset accuracy breakdown, and reputation score.
-    Needs at least 24 hours of data to produce meaningful results.
-    """
+    """Get rolling 30-day signal accuracy and reputation score. Returns reputation_score (0-100), accuracy_30d (%), signals_evaluated, breakdown by timeframe (24h/48h) and per-asset, plus scoring methodology. If <24h of history: returns status="collecting_data". Use to assess signal reliability and track improvement over time."""
     store = _get_store()
 
     stats = store.load_accuracy_stats(days=30)
@@ -429,17 +370,9 @@ def get_performance() -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_asset_performance
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_asset_performance(asset: str) -> str:
-    """
-    Get performance tracking for a specific crypto asset.
-
-    Args:
-        asset: The crypto asset ticker (e.g. BTC, ETH, SOL). Case-insensitive.
-
-    Shows how accurately our signals predicted this asset's price movement,
-    including per-asset accuracy in the rolling 30-day window.
-    """
+    """Get accuracy metrics for a specific asset over the rolling 30-day window. Takes one ticker (case-insensitive). Returns asset accuracy_30d (%), overall_accuracy_30d, reputation_score, and last_updated. If no data: returns status="collecting_data". Invalid asset returns error with valid list. Use to identify which assets have strongest signal accuracy."""
     asset = asset.upper().strip()
     if asset not in VALID_ASSETS:
         return json.dumps({
@@ -473,21 +406,9 @@ def get_asset_performance(asset: str) -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_analytics — API usage analytics
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_analytics(days: int = 7) -> str:
-    """
-    Get API usage analytics — who is calling the API and how often.
-
-    Args:
-        days: Number of days to look back (1-90, default 7).
-
-    Returns total requests, unique clients, requests per day, endpoint
-    popularity, client type breakdown (Claude, OpenAI, Python, browsers, etc.),
-    and average response time.
-
-    Useful for understanding adoption, identifying AI agent usage patterns,
-    and monitoring API health.
-    """
+    """Monitor API usage patterns over configurable window (1-90 days, default 7). Returns total_requests, unique_clients, avg_response_ms, breakdowns by endpoint and client_type (Claude, OpenAI, Python, browser), requests_per_day, and top_user_agents. Use for adoption monitoring, AI agent pattern analysis, or performance regression detection."""
     if days < 1:
         days = 1
     if days > 90:
@@ -511,21 +432,9 @@ def get_analytics(days: int = 7) -> str:
 # ---------------------------------------------------------------------------
 # Tool: get_x402_stats — x402 micropayment analytics
 # ---------------------------------------------------------------------------
-@mcp.tool()
+@mcp.tool(annotations={"readOnlyHint": True})
 def get_x402_stats(days: int = 30) -> str:
-    """
-    Get x402 micropayment analytics — revenue, paid calls, conversion rate.
-
-    Args:
-        days: Number of days to look back (1-90, default 30).
-
-    Returns total paid calls, estimated USDC revenue, 402 challenge count,
-    payment failure count, conversion rate, paid calls by endpoint,
-    paid calls by client type, and daily payment volume.
-
-    Each paid call = $0.001 USDC on Base (eip155:8453).
-    x402 is the HTTP 402 micropayment protocol by Coinbase.
-    """
+    """Get x402 HTTP 402 micropayment analytics (1-90 days, default 30). Returns total_paid_calls, estimated_revenue_usdc ($0.001/call on Base L2), total_402_challenges, payment_failures, conversion_rate_pct, breakdown by endpoint and client_type, paid_per_day timeline, avg_paid_latency_ms. x402 is Coinbase's HTTP micropayment protocol for agent-to-agent commerce."""
     if days < 1:
         days = 1
     if days > 90:

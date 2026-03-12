@@ -18,6 +18,7 @@ from eth_account import Account
 from x402 import x402ClientSync, parse_payment_required
 from x402.mechanisms.evm.exact import ExactEvmClientScheme
 from x402.mechanisms.evm.signers import EthAccountSigner
+from x402.http.utils import encode_payment_signature_header
 
 API_URL = "https://web3-signals-api-production.up.railway.app/signal"
 _INTERNAL_KEY = os.getenv("INTERNAL_API_KEY", "")
@@ -75,16 +76,23 @@ def main():
         payment_payload = x402_client.create_payment_payload(payment_required)
         print(f"  Payment payload created (scheme: {payment_payload.accepted.scheme})")
 
-        # 6. Encode payload and retry with payment header
-        payload_json = payment_payload.model_dump_json()
-        payload_b64 = base64.b64encode(payload_json.encode()).decode()
+        # 6. Encode payload with proper SDK encoding and correct header name
+        payload_encoded = encode_payment_signature_header(payment_payload)
+        # V2 uses PAYMENT-SIGNATURE header, V1 uses X-PAYMENT
+        header_name = "payment-signature" if payment_payload.x402_version == 2 else "x-payment"
+        print(f"  Using header: {header_name} (v{payment_payload.x402_version})")
 
         print(f"\nStep 3: Retrying with payment...")
         resp2 = http.get(
             API_URL,
-            headers={"x-payment": payload_b64},
+            headers={header_name: payload_encoded},
         )
         print(f"  Response: {resp2.status_code}")
+
+        # Debug: show response headers for payment-related info
+        for h in ["payment-response", "payment-required", "x-payment-response"]:
+            if h in resp2.headers:
+                print(f"  Header {h}: {resp2.headers[h][:100]}...")
 
         if resp2.status_code == 200:
             data = resp2.json()

@@ -173,19 +173,113 @@ if _X402_ENABLED:
         network="eip155:8453",
     )
 
-    # Build Bazaar discovery extensions using the official SDK helper
+    # Build Bazaar discovery extensions with rich schemas for agent discovery
+    from x402.extensions.bazaar.resource_service import OutputConfig
+
     _bazaar_signal = (
-        declare_discovery_extension(input={"method": "GET"})
+        declare_discovery_extension(
+            input={"method": "GET"},
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "description": "No query parameters needed. Returns all 20 assets.",
+            },
+            output=OutputConfig(
+                example={
+                    "timestamp": "2026-03-13T10:30:00Z",
+                    "data": {
+                        "portfolio_summary": {
+                            "market_regime": "TRENDING",
+                            "risk_level": "moderate",
+                            "top_buys": ["SOL", "ETH"],
+                            "top_sells": ["XRP"],
+                        },
+                        "signals": {
+                            "BTC": {
+                                "composite_score": 72,
+                                "direction": "bullish",
+                                "label": "BUY",
+                                "dimensions": {
+                                    "whale": {"score": 78, "label": "bullish"},
+                                    "technical": {"score": 65, "label": "neutral"},
+                                    "derivatives": {"score": 70, "label": "bullish"},
+                                    "narrative": {"score": 68, "label": "neutral"},
+                                    "market": {"score": 75, "label": "bullish"},
+                                    "trend": {"score": 72, "label": "bullish"},
+                                },
+                            },
+                        },
+                    },
+                },
+                schema={
+                    "type": "object",
+                    "description": "20-asset portfolio signal fusion with 6 scoring dimensions, market regime, and LLM insights",
+                },
+            ),
+        )
         if declare_discovery_extension else {}
     )
     _bazaar_signal_asset = (
         declare_discovery_extension(
             input={"method": "GET", "path_params": {"asset": "BTC"}},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "asset": {
+                        "type": "string",
+                        "enum": ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT",
+                                 "MATIC", "LINK", "UNI", "ATOM", "LTC", "FIL", "NEAR",
+                                 "APT", "ARB", "OP", "INJ", "SUI"],
+                        "description": "Crypto asset ticker symbol",
+                    },
+                },
+                "required": ["asset"],
+            },
+            output=OutputConfig(
+                example={
+                    "asset": "BTC",
+                    "signal": {
+                        "composite_score": 72,
+                        "direction": "bullish",
+                        "label": "BUY",
+                        "dimensions": {
+                            "whale": {"score": 78, "label": "bullish"},
+                            "technical": {"score": 65, "label": "neutral"},
+                        },
+                        "momentum": {"direction": "rising", "delta": 3.2},
+                    },
+                    "market_context": {"regime": "TRENDING", "risk_level": "moderate"},
+                },
+                schema={
+                    "type": "object",
+                    "description": "Single asset signal with 6-dimension breakdown, momentum, and market context",
+                },
+            ),
         )
         if declare_discovery_extension else {}
     )
     _bazaar_reputation = (
-        declare_discovery_extension(input={"method": "GET"})
+        declare_discovery_extension(
+            input={"method": "GET"},
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "description": "No parameters. Returns 30-day rolling accuracy metrics.",
+            },
+            output=OutputConfig(
+                example={
+                    "reputation_score": 68,
+                    "accuracy_30d": 68.4,
+                    "signals_evaluated": 340,
+                    "by_timeframe": {"24h": {"accuracy": 70.2}, "48h": {"accuracy": 66.1}},
+                    "by_asset": {"BTC": 75.0, "ETH": 62.5},
+                },
+                schema={
+                    "type": "object",
+                    "description": "30-day rolling signal accuracy with per-asset and per-timeframe breakdown",
+                },
+            ),
+        )
         if declare_discovery_extension else {}
     )
 
@@ -2240,6 +2334,57 @@ async def agent_card():
 
 
 # ---------------------------------------------------------------------------
+# /.well-known/mcp.json — MCP server auto-discovery (Claude, Cursor, GPT)
+# ---------------------------------------------------------------------------
+@app.get("/.well-known/mcp.json", tags=["discovery"], include_in_schema=False)
+async def mcp_discovery():
+    """MCP server discovery — tells AI agents how to connect to our MCP tools."""
+    base_url = os.getenv("BASE_URL", "http://localhost:8000")
+    return {
+        "name": "Web3 Signals — AgentMarketSignal",
+        "description": (
+            "AI-powered crypto signal intelligence for 20 assets. "
+            "6 scoring dimensions (whale, technical, derivatives, narrative, market, trend), "
+            "composite scores 0-100, market regime detection, and 30-day accuracy tracking. "
+            "Updated every 15 minutes."
+        ),
+        "version": "0.3.0",
+        "tools": 9,
+        "transports": {
+            "sse": f"{base_url}/mcp/sse",
+            "streamable_http": f"{base_url}/mcp/stream",
+        },
+        "capabilities": [
+            "get_market_briefing — Executive summary with top buys/sells and regime context",
+            "get_all_signals — Full 20-asset fusion with portfolio summary and LLM insights",
+            "get_asset_signal — Single asset signal with 6-dimension breakdown",
+            "compare_assets — Side-by-side ranking of 2-5 assets",
+            "get_health — Agent pipeline status and uptime",
+            "get_performance — 30-day rolling accuracy metrics",
+            "get_asset_performance — Per-asset accuracy breakdown",
+            "get_analytics — API usage stats and client type analysis",
+            "get_x402_stats — x402 micropayment revenue and conversion analytics",
+        ],
+        "pricing": {
+            "mcp_tools": "free",
+            "rest_signal_endpoints": "$0.001 USDC via x402 (Base L2)",
+        },
+        "assets": [
+            "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "AVAX", "DOT",
+            "MATIC", "LINK", "UNI", "ATOM", "LTC", "FIL", "NEAR",
+            "APT", "ARB", "OP", "INJ", "SUI",
+        ],
+        "links": {
+            "openapi": f"{base_url}/openapi.json",
+            "agent_card": f"{base_url}/.well-known/agent.json",
+            "agents_md": f"{base_url}/.well-known/agents.md",
+            "x402": f"{base_url}/.well-known/x402.json",
+            "docs": f"{base_url}/docs",
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # AGENTS.md — Agentic AI Foundation discovery
 # ---------------------------------------------------------------------------
 @app.get("/.well-known/agents.md", tags=["discovery"], include_in_schema=False)
@@ -2324,11 +2469,13 @@ Disallow: /admin/
 Disallow: /mcp/messages
 
 # AI Agent Discovery
+# MCP Server: /.well-known/mcp.json
 # Agent Card: /.well-known/agent.json
 # AGENTS.md: /.well-known/agents.md
 # x402 Payments: /.well-known/x402.json
 # OpenAPI Spec: /openapi.json
-# MCP Transport: /mcp/sse
+# MCP SSE: /mcp/sse
+# MCP Streamable HTTP: /mcp/stream
 
 Sitemap: none
 """
