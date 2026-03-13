@@ -54,7 +54,7 @@ try:
     from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
     from x402.http.facilitator_client_base import CreateHeadersAuthProvider
     from x402.http.middleware.fastapi import PaymentMiddlewareASGI
-    from x402.http.types import RouteConfig as X402RouteConfig
+    from x402.http.types import RouteConfig as X402RouteConfig, HTTPResponseBody
     from x402.mechanisms.evm.exact import ExactEvmServerScheme
     from x402.server import x402ResourceServer
     _X402_AVAILABLE = True
@@ -284,6 +284,97 @@ if _X402_ENABLED:
         if declare_discovery_extension else {}
     )
 
+    # --- unpaid_response_body callbacks: return rich SAMPLE data in 402 ---
+    # This is critical for agent discovery. Competitors like tick.hugen.tokyo
+    # return sample data showing what the paid response looks like.
+    def _unpaid_signal_body(ctx):
+        """Return sample signal data in the 402 body so agents know what they'll get."""
+        return HTTPResponseBody(
+            content_type="application/json",
+            body={
+                "_notice": "Payment required ($0.001 USDC on Base). Sample data below.",
+                "_protocol": "x402",
+                "_docs": "https://web3-signals-api-production.up.railway.app/docs",
+                "_hint": "Decode the PAYMENT-REQUIRED response header (base64 JSON) for payment details.",
+                "sample": {
+                    "portfolio_summary": {
+                        "market_regime": "TRENDING",
+                        "risk_level": "moderate",
+                        "top_buys": ["SOL", "ETH"],
+                        "top_sells": ["XRP"],
+                        "total_assets": 20,
+                    },
+                    "signals": {
+                        "BTC": {
+                            "composite_score": 62,
+                            "direction": "bullish",
+                            "label": "MODERATE BUY",
+                            "dimensions": {
+                                "whale": {"score": 68, "label": "bullish"},
+                                "technical": {"score": 55, "label": "neutral"},
+                                "derivatives": {"score": 70, "label": "bullish"},
+                                "narrative": {"score": 58, "label": "neutral"},
+                                "market": {"score": 65, "label": "bullish"},
+                                "trend": {"score": 60, "label": "neutral"},
+                            },
+                            "llm_insight": "Whale accumulation supports upside bias...",
+                        },
+                        "_truncated": "... 19 more assets in paid response",
+                    },
+                },
+            },
+        )
+
+    def _unpaid_signal_asset_body(ctx):
+        """Return sample single-asset data in the 402 body."""
+        asset = ctx.path.split("/")[-1].upper() if "/" in ctx.path else "BTC"
+        return HTTPResponseBody(
+            content_type="application/json",
+            body={
+                "_notice": f"Payment required ($0.001 USDC on Base). Sample {asset} signal below.",
+                "_protocol": "x402",
+                "_docs": "https://web3-signals-api-production.up.railway.app/docs",
+                "sample": {
+                    "asset": asset,
+                    "signal": {
+                        "composite_score": 62,
+                        "direction": "bullish",
+                        "label": "MODERATE BUY",
+                        "dimensions": {
+                            "whale": {"score": 68, "label": "bullish"},
+                            "technical": {"score": 55, "label": "neutral"},
+                            "derivatives": {"score": 70, "label": "bullish"},
+                        },
+                        "momentum": {"direction": "rising", "delta": 3.2},
+                        "llm_insight": "Whale accumulation pattern detected...",
+                    },
+                    "market_context": {"regime": "TRENDING", "risk_level": "moderate"},
+                    "_truncated": "Full 6-dimension breakdown in paid response",
+                },
+            },
+        )
+
+    def _unpaid_reputation_body(ctx):
+        """Return sample reputation data in the 402 body."""
+        return HTTPResponseBody(
+            content_type="application/json",
+            body={
+                "_notice": "Payment required ($0.001 USDC on Base). Sample accuracy data below.",
+                "_protocol": "x402",
+                "_docs": "https://web3-signals-api-production.up.railway.app/docs",
+                "sample": {
+                    "reputation_score": 68,
+                    "accuracy_30d": 67.5,
+                    "signals_evaluated": 340,
+                    "by_timeframe": {
+                        "24h": {"accuracy_pct": 65.2, "total_evaluated": 170},
+                        "48h": {"accuracy_pct": 69.8, "total_evaluated": 170},
+                    },
+                    "_truncated": "Per-asset breakdown in paid response",
+                },
+            },
+        )
+
     _x402_routes = {
         "GET /signal": X402RouteConfig(
             accepts=[_payment_option],
@@ -294,6 +385,7 @@ if _X402_ENABLED:
             ),
             mime_type="application/json",
             extensions=_bazaar_signal,
+            unpaid_response_body=_unpaid_signal_body,
         ),
         "GET /signal/*": X402RouteConfig(
             accepts=[_payment_option],
@@ -303,6 +395,7 @@ if _X402_ENABLED:
             ),
             mime_type="application/json",
             extensions=_bazaar_signal_asset,
+            unpaid_response_body=_unpaid_signal_asset_body,
         ),
         "GET /performance/reputation": X402RouteConfig(
             accepts=[_payment_option],
@@ -312,6 +405,7 @@ if _X402_ENABLED:
             ),
             mime_type="application/json",
             extensions=_bazaar_reputation,
+            unpaid_response_body=_unpaid_reputation_body,
         ),
     }
     logger.info("x402: configured %d paid routes (pay_to=%s...)", len(_x402_routes), _PAY_TO[:10])
@@ -1179,6 +1273,11 @@ app.add_middleware(
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=[
+        "PAYMENT-REQUIRED", "PAYMENT-RESPONSE",
+        "X-PAYMENT", "X-PAYMENT-RESPONSE",
+        "Mcp-Session-Id",
+    ],
 )
 
 
@@ -1213,6 +1312,7 @@ async def root():
             "/.well-known/x402.json": "x402 payment protocol discovery (detailed)",
             "/openapi.json": "OpenAPI 3.0 specification",
             "/docs": "Swagger UI — interactive API documentation",
+            "/llms.txt": "LLM-friendly API overview for AI agent discovery",
             "/robots.txt": "Crawler guidance",
         },
         "assets": [
@@ -2493,6 +2593,63 @@ async def x402_discovery_compat():
 
 
 # ---------------------------------------------------------------------------
+# /llms.txt — LLM-friendly API description for AI agent discovery
+# ---------------------------------------------------------------------------
+@app.get("/llms.txt", include_in_schema=False)
+@app.get("/.well-known/llms.txt", include_in_schema=False)
+async def llms_txt():
+    """llms.txt — Machine-readable API overview for LLMs and AI agents."""
+    base_url = os.getenv("BASE_URL", "https://web3-signals-api-production.up.railway.app")
+    content = f"""# Web3 Signals API — AI-Powered Crypto Signal Intelligence
+
+> Scored buy/sell signals for 20 crypto assets, updated every 15 minutes.
+> 6 scoring dimensions: whale activity, technicals, derivatives, narrative, market sentiment, trend.
+> Verifiable 30-day rolling accuracy (~67% binary directional accuracy).
+
+## API Endpoints
+
+### Free (No Auth)
+- GET {base_url}/health — Service health and agent pipeline status
+- GET {base_url}/performance — Signal accuracy metrics (30-day rolling)
+- GET {base_url}/performance/{{asset}} — Per-asset accuracy (e.g. /performance/BTC)
+- GET {base_url}/analytics — API usage analytics
+
+### Paid ($0.001 USDC on Base via x402 protocol)
+- GET {base_url}/signal — All 20 asset signals with portfolio summary
+- GET {base_url}/signal/{{asset}} — Single asset signal (e.g. /signal/BTC)
+- GET {base_url}/performance/reputation — Verified accuracy reputation score
+
+### MCP Server (Free)
+- SSE: {base_url}/mcp/sse
+- Streamable HTTP: {base_url}/mcp/stream
+
+## Supported Assets
+BTC, ETH, SOL, BNB, XRP, ADA, AVAX, DOT, MATIC, LINK, UNI, ATOM, LTC, FIL, NEAR, APT, ARB, OP, INJ, SUI
+
+## Signal Scoring
+- 0-100 composite score per asset
+- Above 62: High-conviction buy | Below 38: High-conviction sell
+- Each signal includes: composite_score, direction, label, 6 dimension scores, momentum, llm_insight
+
+## Payment Protocol
+x402 (HTTP 402 Payment Required). Pay $0.001 USDC per call on Base L2.
+No API keys. No signup. Payment IS authentication.
+Agent needs: Base wallet + USDC + x402 SDK.
+
+## Discovery
+- MCP: {base_url}/.well-known/mcp.json
+- Agent Card: {base_url}/.well-known/agent.json
+- AGENTS.md: {base_url}/.well-known/agents.md
+- x402: {base_url}/.well-known/x402.json
+- OpenAPI: {base_url}/openapi.json
+
+## Documentation
+- Full docs: {base_url}/docs
+- GitHub: https://github.com/manavaga/web3-signals-mcp
+"""
+    return PlainTextResponse(content.strip(), media_type="text/plain")
+
+
 # /robots.txt — Guide AI crawlers and search engines
 # ---------------------------------------------------------------------------
 @app.get("/robots.txt", include_in_schema=False)
@@ -2506,6 +2663,7 @@ Allow: /.well-known/
 Allow: /health
 Allow: /performance
 Allow: /analytics
+Allow: /llms.txt
 Disallow: /api/
 Disallow: /admin/
 Disallow: /mcp/messages
@@ -2515,6 +2673,7 @@ Disallow: /mcp/messages
 # Agent Card: /.well-known/agent.json
 # AGENTS.md: /.well-known/agents.md
 # x402 Payments: /.well-known/x402.json
+# LLMs: /llms.txt
 # OpenAPI Spec: /openapi.json
 # MCP SSE: /mcp/sse
 # MCP Streamable HTTP: /mcp/stream
