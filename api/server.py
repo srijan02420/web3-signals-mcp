@@ -54,8 +54,17 @@ try:
     from x402.http import HTTPFacilitatorClient, FacilitatorConfig, PaymentOption
     from x402.http.facilitator_client_base import CreateHeadersAuthProvider
     from x402.http.middleware.fastapi import PaymentMiddlewareASGI
-    from x402.http.types import RouteConfig as X402RouteConfig, HTTPResponseBody
+    from x402.http.types import RouteConfig as X402RouteConfig
     from x402.mechanisms.evm.exact import ExactEvmServerScheme
+    try:
+        from x402.http.types import HTTPResponseBody as _HTTPResponseBody
+    except ImportError:
+        from dataclasses import dataclass as _dc
+        @_dc
+        class _HTTPResponseBody:
+            content_type: str
+            body: object
+    HTTPResponseBody = _HTTPResponseBody
     from x402.server import x402ResourceServer
     _X402_AVAILABLE = True
     logger.info("x402: imports OK")
