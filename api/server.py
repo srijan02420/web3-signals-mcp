@@ -1352,18 +1352,8 @@ app.add_middleware(
 )
 
 
-# Proxy scheme rewrite — Railway proxies HTTPS→HTTP internally.
-# Without this, x402 SDK infers http:// resource URLs from request.url.
-# This middleware rewrites the request scheme to HTTPS when X-Forwarded-Proto
-# is set, so all downstream middleware (including x402) see the correct URL.
-class ProxySchemeMiddleware(BaseHTTPMiddleware):
-    """Rewrite request scheme to HTTPS when behind a reverse proxy."""
-    async def dispatch(self, request, call_next):
-        if request.headers.get("x-forwarded-proto") == "https":
-            request.scope["scheme"] = "https"
-        return await call_next(request)
-
-app.add_middleware(ProxySchemeMiddleware)
+# NOTE: ProxySchemeMiddleware temporarily disabled for debugging.
+# TODO: Re-enable once settlement 500 is fixed.
 
 
 # ---------------------------------------------------------------------------
