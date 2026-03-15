@@ -12,6 +12,11 @@ from urllib.request import Request, urlopen
 from shared.profile_loader import load_profile
 from shared.storage import Storage
 
+# Phase D: Calibrated pipeline components
+from signal_fusion.calibrator import SignalCalibrator
+from signal_fusion.meta_learner import MetaLearner
+from signal_fusion.meta_labeler import MetaLabeler
+
 
 def _fg_regime(fg_value: Optional[float]) -> str:
     """Classify Fear & Greed index into a regime label."""
@@ -39,7 +44,14 @@ class SignalFusion:
     def __init__(self, profile_path: str | None = None, db_path: str = "signals.db") -> None:
         default = Path(__file__).resolve().parent / "profiles" / "default.yaml"
         self.profile = load_profile(Path(profile_path) if profile_path else default)
-        self.assets: List[str] = [a.upper() for a in self.profile.get("assets", [])]
+        all_assets = [a.upper() for a in self.profile.get("assets", [])]
+        # Phase A2: Asset blacklist — filter out anti-predictive assets
+        blacklist_cfg = self.profile.get("asset_blacklist", {})
+        if blacklist_cfg.get("enabled", False):
+            blacklisted = {a.upper() for a in blacklist_cfg.get("assets", [])}
+            self.assets: List[str] = [a for a in all_assets if a not in blacklisted]
+        else:
+            self.assets: List[str] = all_assets
         self.store = Storage(db_path)
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
 
@@ -49,6 +61,180 @@ class SignalFusion:
             self.config_hash = hashlib.sha256(yaml_path.read_bytes()).hexdigest()[:12]
         except Exception:
             self.config_hash = "unknown"
+
+        # Phase D: Load calibrated pipeline models
+        self._load_phase_d_models()
+
+    def _load_phase_d_models(self) -> None:
+        """Load Phase D models: Platt calibrator, meta-learner, meta-labeler."""
+        models_dir = Path(__file__).resolve().parent / "models"
+
+        self.calibrator = SignalCalibrator()
+        self.meta_learner = MetaLearner()
+        self.meta_labeler = MetaLabeler()
+
+        # Load Platt calibrator
+        cal_path = models_dir / "platt_calibrators.json"
+        if not self.calibrator.load(str(cal_path)):
+            pass  # Will use fallback linear mapping
+
+        # Load meta-learner
+        if not self.meta_learner.load():
+            pass  # Will use fallback weighted average
+
+        # Load meta-labeler
+        if not self.meta_labeler.load():
+            pass  # Will use fallback distance-from-center
+
+    # ================================================================ #
+    #  Predicted move + conviction helpers (Phase D)
+    # ================================================================ #
+
+    def _compute_predicted_move(
+        self, asset: str, composite: float, direction: str
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Compute expected price move based on composite score and asset volatility.
+
+        Uses per-asset volatility thresholds from YAML to map composite score
+        distance-from-center to an expected % move with range.
+        """
+        accuracy_cfg = self.profile.get("accuracy", {})
+        pat_cfg = accuracy_cfg.get("per_asset_thresholds", {})
+
+        if not pat_cfg.get("enabled", False):
+            return None
+
+        asset_thresholds = pat_cfg.get("assets", {}).get(asset)
+        if not asset_thresholds:
+            # Default thresholds for unknown assets
+            noise_pct = 2.0
+            strong_pct = 5.0
+        else:
+            noise_pct = float(asset_thresholds.get("noise_threshold_pct", 2.0))
+            strong_pct = float(asset_thresholds.get("strong_threshold_pct", 5.0))
+
+        distance = abs(composite - 50)
+
+        # Map distance to expected move range
+        if distance > 15:
+            # High conviction: expect strong move
+            expected_pct = strong_pct
+            range_low = noise_pct
+            range_high = strong_pct * 1.5
+            conf = "high"
+        elif distance > 10:
+            # Medium conviction: noise to strong
+            expected_pct = (noise_pct + strong_pct) / 2
+            range_low = noise_pct * 0.5
+            range_high = strong_pct
+            conf = "medium"
+        elif distance > 5:
+            # Low conviction: 0 to noise
+            expected_pct = noise_pct * 0.5
+            range_low = 0.0
+            range_high = noise_pct
+            conf = "low"
+        else:
+            # Negligible — too close to center
+            return {
+                "expected_pct": 0.0,
+                "range_low_pct": 0.0,
+                "range_high_pct": round(noise_pct * 0.5, 2),
+                "horizon": "24h",
+                "confidence": "negligible",
+            }
+
+        # Apply direction sign
+        sign = 1.0 if direction == "bullish" else -1.0 if direction == "bearish" else 0.0
+
+        return {
+            "expected_pct": round(sign * expected_pct, 2),
+            "range_low_pct": round(sign * range_low if sign >= 0 else sign * range_high, 2),
+            "range_high_pct": round(sign * range_high if sign >= 0 else sign * range_low, 2),
+            "horizon": "24h",
+            "confidence": conf,
+        }
+
+    def _compute_conviction(
+        self,
+        composite: float,
+        calibrated_confidence: Optional[Dict[str, Any]],
+        data_tiers: Dict[str, str],
+    ) -> str:
+        """
+        Compute conviction level from composite score distance, calibrated
+        confidence edge, and data quality.
+        """
+        distance = abs(composite - 50)
+
+        # Base conviction from distance
+        if distance > 15:
+            base = "high"
+        elif distance > 10:
+            base = "medium"
+        elif distance > 5:
+            base = "low"
+        else:
+            return "none"
+
+        # Adjust based on calibrated edge
+        if calibrated_confidence:
+            edge = calibrated_confidence.get("kelly_edge", 0)
+            if edge < 0.03 and base == "high":
+                base = "medium"
+            elif edge > 0.15 and base == "low":
+                base = "medium"
+
+        # Poor data quality can downgrade
+        full_tiers = sum(1 for t in data_tiers.values() if t == "full")
+        if full_tiers < 2 and base in ("high", "medium"):
+            base = "low"
+
+        return base
+
+    def _compute_signal_strength(
+        self,
+        conviction: str,
+        calibrated_confidence: Optional[Dict[str, Any]],
+        data_tiers: Dict[str, str],
+        dimension_agreement: int,
+    ) -> str:
+        """
+        Compute signal strength: combines conviction + agreement + data quality.
+
+        Returns: "strong", "moderate", or "weak"
+        """
+        # If calibrated edge is negative, signal has no edge → weak
+        if calibrated_confidence:
+            edge = calibrated_confidence.get("kelly_edge", 0)
+            if edge <= 0:
+                return "weak"
+
+        score = 0
+        if conviction == "high":
+            score += 3
+        elif conviction == "medium":
+            score += 2
+        elif conviction == "low":
+            score += 1
+
+        if dimension_agreement >= 4:
+            score += 2
+        elif dimension_agreement >= 3:
+            score += 1
+
+        full_tiers = sum(1 for t in data_tiers.values() if t == "full")
+        if full_tiers >= 4:
+            score += 2
+        elif full_tiers >= 2:
+            score += 1
+
+        if score >= 5:
+            return "strong"
+        elif score >= 3:
+            return "moderate"
+        return "weak"
 
     def fuse(self) -> Dict[str, Any]:
         """Main entry: load latest agent data, score, label, summarise."""
@@ -396,6 +582,27 @@ class SignalFusion:
                     for role in full_data_roles:
                         adjusted_weights[role] += total_freed * (base_weights[role] / full_data_sum)
 
+            # --- Phase C3: Data quality gating — reduce weight of no-data dims ---
+            dq_cfg = self.profile.get("data_quality_gating", {})
+            data_quality_abstain = False
+            if dq_cfg.get("enabled", False):
+                no_data_penalty = float(dq_cfg.get("no_data_weight_penalty", 0.3))
+                dims_with_data = sum(1 for r in all_roles if data_tiers[r] != "none")
+
+                for role in all_roles:
+                    if data_tiers[role] == "none":
+                        adjusted_weights[role] *= no_data_penalty
+
+                # Renormalize
+                total_w = sum(adjusted_weights.values())
+                if total_w > 0:
+                    for role in all_roles:
+                        adjusted_weights[role] = adjusted_weights[role] / total_w
+
+                min_dims = int(dq_cfg.get("min_dimensions_with_data", 3))
+                if dims_with_data < min_dims:
+                    data_quality_abstain = True
+
             # --- Phase 4: Build dimensions dict and compute composite ---
             # Apply trend dampening: in confirmed downtrends, pull affected
             # dimension scores toward 50, reducing the contrarian boost.
@@ -441,6 +648,45 @@ class SignalFusion:
 
             composite = round(composite, 1)
 
+            # --- Phase C2: Cross-dimensional features ---
+            cross_dim_cfg = self.profile.get("cross_dimensional", {})
+            cross_dim_adjustment = 0.0
+            if cross_dim_cfg.get("enabled", False):
+                oi_div = cross_dim_cfg.get("oi_price_divergence", {})
+                if oi_div.get("enabled", False):
+                    d_score = raw_scores.get("derivatives", (50, ""))[0]
+                    m_score = raw_scores.get("market", (50, ""))[0]
+                    if (d_score > float(oi_div.get("derivatives_high_threshold", 60)) and
+                            m_score < float(oi_div.get("market_low_threshold", 45))):
+                        cross_dim_adjustment += float(oi_div.get("penalty", -4))
+
+                wd_bear = cross_dim_cfg.get("whale_derivatives_bearish", {})
+                if wd_bear.get("enabled", False):
+                    w_score = raw_scores.get("whale", (50, ""))[0]
+                    d_score = raw_scores.get("derivatives", (50, ""))[0]
+                    if (w_score < float(wd_bear.get("whale_low_threshold", 35)) and
+                            d_score < float(wd_bear.get("derivatives_low_threshold", 35))):
+                        cross_dim_adjustment += float(wd_bear.get("penalty", -5))
+
+                multi_bear = cross_dim_cfg.get("multi_dim_bearish", {})
+                if multi_bear.get("enabled", False):
+                    b_thresh = float(multi_bear.get("bearish_threshold", 45))
+                    min_agree = int(multi_bear.get("min_agreeing", 4))
+                    bear_dims = sum(1 for r in all_roles if raw_scores[r][0] < b_thresh)
+                    if bear_dims >= min_agree:
+                        cross_dim_adjustment += float(multi_bear.get("penalty", -6))
+
+                tm_bear = cross_dim_cfg.get("tech_market_bearish", {})
+                if tm_bear.get("enabled", False):
+                    t_score = raw_scores.get("technical", (50, ""))[0]
+                    m_score = raw_scores.get("market", (50, ""))[0]
+                    if (t_score < float(tm_bear.get("technical_threshold", 40)) and
+                            m_score < float(tm_bear.get("market_threshold", 42))):
+                        cross_dim_adjustment += float(tm_bear.get("penalty", -3))
+
+                if cross_dim_adjustment != 0:
+                    composite = round(max(0.0, min(100.0, composite + cross_dim_adjustment)), 1)
+
             # --- Phase 4.5: Velocity dampening ---
             # When indicators are accelerating against the signal direction,
             # dampen the composite toward 50. This prevents premature contrarian
@@ -467,25 +713,45 @@ class SignalFusion:
                     errors.append(f"velocity {asset}: {exc}")
 
             # --- Phase 5: Abstain check ---
-            # Use the pre-computed resolved_distance (dynamic F&G-based or fallback).
-            # When dynamic abstain changes the threshold, align MODERATE BUY/SELL
-            # boundaries with the abstain zone edges so there's no dead gap.
+            # Phase A1 (2026-03-16): Asymmetric abstain zones.
+            # Bearish signals (composite < 50) use tighter threshold (more signals pass).
+            # Bullish signals (composite > 50) use wider threshold (fewer, higher quality).
             abstain_applied = False
-            if abstain_cfg.get("enabled", False):
-                if abs(composite - 50.0) < resolved_distance:
-                    abstain_applied = True
+            if data_quality_abstain:
+                # Phase C3: Data quality gate — insufficient dimensions with data
+                abstain_applied = True
+                label_name = "INSUFFICIENT DATA"
+                direction = "neutral"
+            elif abstain_cfg.get("enabled", False):
+                asym_cfg = abstain_cfg.get("asymmetric", {})
+                if asym_cfg.get("enabled", False):
+                    bearish_dist = float(asym_cfg.get("bearish_min_distance", resolved_distance))
+                    bullish_dist = float(asym_cfg.get("bullish_min_distance", resolved_distance))
+                    if composite < 50.0 and (50.0 - composite) < bearish_dist:
+                        abstain_applied = True
+                    elif composite > 50.0 and (composite - 50.0) < bullish_dist:
+                        abstain_applied = True
+                    elif composite == 50.0:
+                        abstain_applied = True
+                else:
+                    if abs(composite - 50.0) < resolved_distance:
+                        abstain_applied = True
+
+                if abstain_applied:
                     label_name = abstain_cfg.get("abstain_label", "INSUFFICIENT EDGE")
                     direction = "neutral"
                 else:
                     # Build dynamic label config: MODERATE BUY at 50+threshold,
                     # NEUTRAL lower bound at 50-threshold.
+                    buy_threshold = float(asym_cfg.get("bullish_min_distance", resolved_distance)) if asym_cfg.get("enabled") else resolved_distance
+                    sell_threshold = float(asym_cfg.get("bearish_min_distance", resolved_distance)) if asym_cfg.get("enabled") else resolved_distance
                     dynamic_labels = []
                     for entry in label_cfg:
                         e = dict(entry)
                         if e.get("name") == "MODERATE BUY":
-                            e["min_score"] = 50.0 + resolved_distance
+                            e["min_score"] = 50.0 + buy_threshold
                         elif e.get("name") == "NEUTRAL":
-                            e["min_score"] = 50.0 - resolved_distance
+                            e["min_score"] = 50.0 - sell_threshold
                         dynamic_labels.append(e)
                     label_name, direction = self._classify(composite, dynamic_labels)
             else:
@@ -506,6 +772,62 @@ class SignalFusion:
             else:
                 momentum = "new"
 
+            # --- Phase D: Calibrated confidence, predicted move, conviction ---
+            dim_scores_dict = {r: raw_scores[r][0] for r in all_roles}
+            dim_weights_dict = {r: adjusted_weights.get(r, 0.1) for r in all_roles}
+
+            # Calibrated confidence (Platt-scaled probability of correct direction)
+            calibrated_confidence = None
+            try:
+                calibrated_confidence = self.calibrator.compute_signal_confidence(
+                    dim_scores_dict, dim_weights_dict, data_tiers
+                )
+            except Exception as exc:
+                errors.append(f"calibrator {asset}: {exc}")
+
+            # Meta-learner prediction (ML-based composite)
+            meta_prediction = None
+            try:
+                if self.meta_learner.is_fitted:
+                    meta_prediction = self.meta_learner.predict(dim_scores_dict, fg_value)
+            except Exception as exc:
+                errors.append(f"meta_learner {asset}: {exc}")
+
+            # Meta-labeler (signal quality assessment)
+            meta_label_result = None
+            try:
+                if self.meta_labeler.is_fitted:
+                    ml_emit, ml_prob, ml_reason = self.meta_labeler.should_emit(
+                        composite, dim_scores_dict, data_tiers, momentum
+                    )
+                    meta_label_result = {
+                        "should_emit": ml_emit,
+                        "probability": round(ml_prob, 4),
+                        "reason": ml_reason,
+                    }
+            except Exception as exc:
+                errors.append(f"meta_labeler {asset}: {exc}")
+
+            # Conviction level
+            conviction = self._compute_conviction(
+                composite, calibrated_confidence, data_tiers
+            )
+
+            # Dimension agreement for signal strength
+            bullish_dims = sum(1 for s in dim_scores_dict.values() if s > 55)
+            bearish_dims = sum(1 for s in dim_scores_dict.values() if s < 45)
+            dim_agreement = max(bullish_dims, bearish_dims)
+
+            # Signal strength (strong / moderate / weak)
+            signal_strength = self._compute_signal_strength(
+                conviction, calibrated_confidence, data_tiers, dim_agreement
+            )
+
+            # Predicted move (expected % change with range)
+            predicted_move = self._compute_predicted_move(
+                asset, composite, direction
+            )
+
             signals[asset] = {
                 "composite_score": composite,
                 "label": label_name,
@@ -522,6 +844,13 @@ class SignalFusion:
                 "config_version": self.config_hash,
                 "regime_at_generation": _fg_regime(fg_value),
                 "per_asset_weights": using_per_asset,
+                # Phase D: New enrichment fields
+                "conviction": conviction,
+                "signal_strength": signal_strength,
+                "predicted_move": predicted_move,
+                "meta_learner": meta_prediction,
+                "meta_label": meta_label_result,
+                "calibrated_confidence": calibrated_confidence,
             }
 
             # Store current score for next momentum comparison
@@ -584,7 +913,7 @@ class SignalFusion:
         result = {
             "agent": "signal_fusion",
             "profile": self.profile.get("name", "signal_fusion_default"),
-            "model_version": "v0.2.0-regime-aware",
+            "model_version": "v0.3.0-calibrated",
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "success" if not errors else "partial",
             "data": {
@@ -632,6 +961,11 @@ class SignalFusion:
     # ================================================================ #
 
     def _score_whale(self, asset: str, data: Dict[str, Any], rules: Dict[str, Any]) -> Tuple[float, str]:
+        """Score whale dimension for one asset.
+
+        Phase B2: Now supports volume_ratio scoring mode (USD-weighted).
+        Falls back to count-based ratio if USD amounts unavailable.
+        """
         base_score = float(rules.get("base_score", 50))
         score = base_score
         details: List[str] = []
@@ -645,11 +979,37 @@ class SignalFusion:
         scoring_mode = str(rules.get("scoring_mode", "ratio"))
         directional = accum_count + sell_count
 
-        if scoring_mode == "ratio" and directional >= int(rules.get("min_directional_moves", 2)):
-            # Ratio-based: accumulate/(accumulate+sell) mapped to 0-max points
+        if scoring_mode == "volume_ratio" and directional >= int(rules.get("min_directional_moves", 2)):
+            # Phase B2: Volume-weighted ratio scoring (E3 Fix 1)
+            # A $500M accumulation dominates over twenty $100K transfers
+            accum_volume = sum(
+                float(m.get("amount_usd", 0))
+                for m in asset_moves
+                if m.get("action") == "accumulate"
+            )
+            sell_volume = sum(
+                float(m.get("amount_usd", 0))
+                for m in asset_moves
+                if m.get("action") == "sell"
+            )
+            total_vol = accum_volume + sell_volume
+            if total_vol > 0:
+                ratio = accum_volume / total_vol
+                max_pts = float(rules.get("ratio_max_points", 60))
+                score = ratio * max_pts
+                details.append(
+                    f"${accum_volume/1e6:.1f}M accumulate, ${sell_volume/1e6:.1f}M sell "
+                    f"(vol ratio {ratio:.0%})")
+            else:
+                # Fallback to count-based if no USD amounts available
+                ratio = accum_count / directional
+                max_pts = float(rules.get("ratio_max_points", 60))
+                score = ratio * max_pts
+                details.append(f"{accum_count} accumulate, {sell_count} sell (count ratio {ratio:.0%})")
+        elif scoring_mode == "ratio" and directional >= int(rules.get("min_directional_moves", 2)):
+            # Legacy count-based ratio scoring
             ratio = accum_count / directional
             max_pts = float(rules.get("ratio_max_points", 60))
-            # ratio 1.0 → max_pts, ratio 0.5 → max_pts/2, ratio 0.0 → 0
             score = ratio * max_pts
             details.append(f"{accum_count} accumulate, {sell_count} sell (ratio {ratio:.0%})")
         elif directional > 0:
@@ -980,6 +1340,29 @@ class SignalFusion:
                 elif oi_chg < -oi_thresh and price_chg < -price_thresh:
                     score -= max_pts * 0.5
                     details.append(f"OI÷price delever: OI{oi_chg:.1f}% price{price_chg:.1f}%")
+
+        # --- Taker buy/sell ratio (Phase C1) ---
+        tr_rules = rules.get("taker_ratio", {})
+        if tr_rules.get("enabled", False):
+            taker_ratio = asset_data.get("taker_buy_sell_ratio")
+            if taker_ratio is not None:
+                bullish_t = float(tr_rules.get("bullish_threshold", 1.1))
+                bearish_t = float(tr_rules.get("bearish_threshold", 0.9))
+                max_pts = float(tr_rules.get("max_points", 10))
+                if taker_ratio > bullish_t:
+                    # Aggressive buyers — bullish signal, scale by intensity
+                    intensity = min((taker_ratio - bullish_t) / (bullish_t * 0.5), 1.0)
+                    pts = float(tr_rules.get("bullish_score", 8)) * max(intensity, 0.5)
+                    score += min(pts, max_pts)
+                    details.append(f"taker {taker_ratio:.3f} bullish")
+                elif taker_ratio < bearish_t:
+                    # Aggressive sellers — bearish signal, scale by intensity
+                    intensity = min((bearish_t - taker_ratio) / (bearish_t * 0.5), 1.0)
+                    pts = float(tr_rules.get("bearish_score", -8)) * max(intensity, 0.5)
+                    score += max(pts, -max_pts)
+                    details.append(f"taker {taker_ratio:.3f} bearish")
+                else:
+                    score += float(tr_rules.get("neutral_score", 0))
 
         return min(100.0, max(0.0, score)), "; ".join(details) if details else "no deriv data"
 

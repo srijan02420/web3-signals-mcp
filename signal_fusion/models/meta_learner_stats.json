@@ -1,0 +1,24 @@
+{
+  "n_samples": 19839,
+  "n_features": 14,
+  "base_rate": 0.46484197792227433,
+  "cv_accuracy_mean": 0.5470623864324652,
+  "cv_accuracy_std": 0.14584788034117308,
+  "cv_brier_mean": 0.24684333924912166,
+  "feature_importances": {
+    "whale": 161,
+    "technical": 405,
+    "derivatives": 156,
+    "narrative": 395,
+    "market": 306,
+    "trend": 396,
+    "score_std": 109,
+    "bullish_count": 39,
+    "bearish_count": 44,
+    "max_score": 197,
+    "min_score": 178,
+    "score_range": 172,
+    "avg_distance": 91,
+    "fear_greed": 0
+  }
+}

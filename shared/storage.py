@@ -950,8 +950,13 @@ class Storage:
         dim_pairs["composite"] = []
         regime_dim_pairs: Dict[str, Dict[str, list]] = defaultdict(lambda: defaultdict(list))
 
+        # Phase B4: Increased minimum slice size from 3 to 5 assets for
+        # meaningful Spearman correlation. With only 3 assets, IC is extremely
+        # noisy and can produce misleading weight updates (I4 research finding).
+        MIN_SLICE_SIZE = 5
+
         for ts, observations in slices.items():
-            if len(observations) < 3:  # Need at least 3 assets for meaningful correlation
+            if len(observations) < MIN_SLICE_SIZE:
                 continue
             returns = [obs["pct_change"] for obs in observations]
             for dim in all_dimensions:
@@ -959,7 +964,7 @@ class Storage:
                 # (skip missing dimensions instead of injecting synthetic 50.0)
                 dim_obs = [(obs["dimensions"][dim], obs["pct_change"])
                            for obs in observations if dim in obs["dimensions"]]
-                if len(dim_obs) >= 3:
+                if len(dim_obs) >= MIN_SLICE_SIZE:
                     dim_scores = [d[0] for d in dim_obs]
                     dim_returns = [d[1] for d in dim_obs]
                     dim_pairs[dim].append((dim_scores, dim_returns))
@@ -971,7 +976,7 @@ class Storage:
             for dim in all_dimensions:
                 dim_obs = [(obs["dimensions"][dim], obs["pct_change"])
                            for obs in observations if dim in obs["dimensions"]]
-                if len(dim_obs) >= 3:
+                if len(dim_obs) >= MIN_SLICE_SIZE:
                     dim_scores = [d[0] for d in dim_obs]
                     dim_returns = [d[1] for d in dim_obs]
                     regime_dim_pairs[regime][dim].append((dim_scores, dim_returns))

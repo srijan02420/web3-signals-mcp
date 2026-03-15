@@ -49,10 +49,25 @@ ACCURACY_CFG = PROFILE.get("accuracy", {
 })
 
 
-def gradient_score(direction: str, pct_change: float) -> float:
-    """Calculate gradient accuracy score (0.0-1.0)."""
-    noise_pct = float(ACCURACY_CFG.get("noise_threshold_pct", 2.0))
-    strong_pct = float(ACCURACY_CFG.get("strong_threshold_pct", 5.0))
+def gradient_score(direction: str, pct_change: float, asset: str = "") -> float:
+    """Calculate gradient accuracy score (0.0-1.0).
+
+    Phase B1: Now supports per-asset volatility-adjusted thresholds.
+    If per_asset_thresholds is enabled and the asset has custom thresholds,
+    use those instead of the global defaults.
+    """
+    # Per-asset thresholds (Phase B1)
+    per_asset_cfg = ACCURACY_CFG.get("per_asset_thresholds", {})
+    if per_asset_cfg.get("enabled", False) and asset:
+        asset_cfg = per_asset_cfg.get("assets", {}).get(asset.upper(), {})
+        noise_pct = float(asset_cfg.get("noise_threshold_pct",
+                          ACCURACY_CFG.get("noise_threshold_pct", 2.0)))
+        strong_pct = float(asset_cfg.get("strong_threshold_pct",
+                           ACCURACY_CFG.get("strong_threshold_pct", 5.0)))
+    else:
+        noise_pct = float(ACCURACY_CFG.get("noise_threshold_pct", 2.0))
+        strong_pct = float(ACCURACY_CFG.get("strong_threshold_pct", 5.0))
+
     g = ACCURACY_CFG.get("gradient", {})
     effective = pct_change if direction == "bullish" else -pct_change
 
@@ -205,7 +220,11 @@ def score_technical(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
 
 
 def score_whale(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
-    """Score whale dimension for one asset using YAML rules."""
+    """Score whale dimension for one asset using YAML rules.
+
+    Phase B2: Now supports volume_ratio scoring mode (USD-weighted).
+    Falls back to count-based ratio if USD amounts unavailable.
+    """
     rules = SCORING_CFG.get("whale", {})
     base_score = float(rules.get("base_score", 50))
     score = base_score
@@ -219,7 +238,34 @@ def score_whale(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
     scoring_mode = str(rules.get("scoring_mode", "ratio"))
     directional = accum_count + sell_count
 
-    if scoring_mode == "ratio" and directional >= int(rules.get("min_directional_moves", 2)):
+    if scoring_mode == "volume_ratio" and directional >= int(rules.get("min_directional_moves", 2)):
+        # Phase B2: Volume-weighted ratio scoring
+        # A $500M accumulation dominates over twenty $100K transfers
+        accum_volume = sum(
+            float(m.get("amount_usd", 0))
+            for m in asset_moves
+            if isinstance(m, dict) and m.get("action") == "accumulate"
+        )
+        sell_volume = sum(
+            float(m.get("amount_usd", 0))
+            for m in asset_moves
+            if isinstance(m, dict) and m.get("action") == "sell"
+        )
+        total_vol = accum_volume + sell_volume
+        if total_vol > 0:
+            ratio = accum_volume / total_vol
+            max_pts = float(rules.get("ratio_max_points", 60))
+            score = ratio * max_pts
+            details.append(
+                f"${accum_volume/1e6:.1f}M accumulate, ${sell_volume/1e6:.1f}M sell "
+                f"(vol ratio {ratio:.0%})")
+        else:
+            # Fallback to count-based if no USD amounts available
+            ratio = accum_count / directional
+            max_pts = float(rules.get("ratio_max_points", 60))
+            score = ratio * max_pts
+            details.append(f"{accum_count} accumulate, {sell_count} sell (count ratio {ratio:.0%})")
+    elif scoring_mode == "ratio" and directional >= int(rules.get("min_directional_moves", 2)):
         ratio = accum_count / directional
         max_pts = float(rules.get("ratio_max_points", 60))
         score = ratio * max_pts
@@ -344,6 +390,29 @@ def score_derivatives(asset: str, data: Dict[str, Any]) -> Tuple[float, str]:
         if ls_ratio < contrarian_threshold and funding_tier == "negative" and combo_bonus != 0:
             score += combo_bonus
             details.append("combo: contrarian+neg_funding")
+
+    # --- Taker buy/sell ratio (Phase C1) ---
+    tr_rules = rules.get("taker_ratio", {})
+    if tr_rules.get("enabled", False):
+        taker_ratio = asset_data.get("taker_buy_sell_ratio")
+        if taker_ratio is not None:
+            bullish_t = float(tr_rules.get("bullish_threshold", 1.1))
+            bearish_t = float(tr_rules.get("bearish_threshold", 0.9))
+            max_pts = float(tr_rules.get("max_points", 10))
+            if taker_ratio > bullish_t:
+                # Aggressive buyers — bullish signal, scale by intensity
+                intensity = min((taker_ratio - bullish_t) / (bullish_t * 0.5), 1.0)
+                pts = float(tr_rules.get("bullish_score", 8)) * max(intensity, 0.5)
+                score += min(pts, max_pts)
+                details.append(f"taker {taker_ratio:.3f} bullish")
+            elif taker_ratio < bearish_t:
+                # Aggressive sellers — bearish signal, scale by intensity
+                intensity = min((bearish_t - taker_ratio) / (bearish_t * 0.5), 1.0)
+                pts = float(tr_rules.get("bearish_score", -8)) * max(intensity, 0.5)
+                score += max(pts, -max_pts)
+                details.append(f"taker {taker_ratio:.3f} bearish")
+            else:
+                score += float(tr_rules.get("neutral_score", 0))
 
     return min(100.0, max(0.0, score)), "; ".join(details) if details else "no deriv data"
 
@@ -892,6 +961,23 @@ def compute_composite(
             for role in full_data_roles:
                 adjusted_weights[role] += total_freed * (base_weights[role] / full_data_sum)
 
+    # Phase C3: Data quality gating — reduce weight of no-data dimensions
+    dq_cfg = PROFILE.get("data_quality_gating", {})
+    if dq_cfg.get("enabled", False):
+        no_data_penalty = float(dq_cfg.get("no_data_weight_penalty", 0.3))
+        dims_with_data = sum(1 for r in ALL_ROLES if data_tiers[r] != "none")
+
+        # Reduce weight of no-data dimensions
+        for role in ALL_ROLES:
+            if data_tiers[role] == "none":
+                adjusted_weights[role] *= no_data_penalty
+
+        # Renormalize weights to sum to 1.0
+        total_w = sum(adjusted_weights.values())
+        if total_w > 0:
+            for role in ALL_ROLES:
+                adjusted_weights[role] = adjusted_weights[role] / total_w
+
     # Compute composite
     dimensions: Dict[str, Dict[str, Any]] = {}
     composite = 0.0
@@ -910,6 +996,58 @@ def compute_composite(
         composite += s * adj_w
 
     composite = round(composite, 1)
+
+    # Phase C2: Cross-dimensional features — score adjustments based on
+    # multi-dimensional patterns (applied AFTER composite, BEFORE abstain)
+    cross_dim_cfg = PROFILE.get("cross_dimensional", {})
+    cross_dim_adjustment = 0.0
+    if cross_dim_cfg.get("enabled", False):
+        # OI-Price Divergence: derivatives high (bullish setup) + market low (price dropping)
+        oi_div = cross_dim_cfg.get("oi_price_divergence", {})
+        if oi_div.get("enabled", False):
+            deriv_score = raw_scores.get("derivatives", (50, ""))[0]
+            market_score = raw_scores.get("market", (50, ""))[0]
+            if (deriv_score > float(oi_div.get("derivatives_high_threshold", 60)) and
+                    market_score < float(oi_div.get("market_low_threshold", 45))):
+                cross_dim_adjustment += float(oi_div.get("penalty", -4))
+
+        # Whale-Derivatives Bearish Confluence
+        wd_bear = cross_dim_cfg.get("whale_derivatives_bearish", {})
+        if wd_bear.get("enabled", False):
+            whale_score = raw_scores.get("whale", (50, ""))[0]
+            deriv_score = raw_scores.get("derivatives", (50, ""))[0]
+            if (whale_score < float(wd_bear.get("whale_low_threshold", 35)) and
+                    deriv_score < float(wd_bear.get("derivatives_low_threshold", 35))):
+                cross_dim_adjustment += float(wd_bear.get("penalty", -5))
+
+        # Multi-Dimension Bearish Agreement
+        multi_bear = cross_dim_cfg.get("multi_dim_bearish", {})
+        if multi_bear.get("enabled", False):
+            bearish_thresh = float(multi_bear.get("bearish_threshold", 45))
+            min_agree = int(multi_bear.get("min_agreeing", 4))
+            bearish_dims = sum(1 for r in ALL_ROLES if raw_scores[r][0] < bearish_thresh)
+            if bearish_dims >= min_agree:
+                cross_dim_adjustment += float(multi_bear.get("penalty", -6))
+
+        # Technical-Market Bearish Alignment
+        tm_bear = cross_dim_cfg.get("tech_market_bearish", {})
+        if tm_bear.get("enabled", False):
+            tech_score = raw_scores.get("technical", (50, ""))[0]
+            market_score = raw_scores.get("market", (50, ""))[0]
+            if (tech_score < float(tm_bear.get("technical_threshold", 40)) and
+                    market_score < float(tm_bear.get("market_threshold", 42))):
+                cross_dim_adjustment += float(tm_bear.get("penalty", -3))
+
+        if cross_dim_adjustment != 0:
+            composite = round(max(0.0, min(100.0, composite + cross_dim_adjustment)), 1)
+
+    # Phase C3 continued: Data quality gate — require minimum dimensions with data
+    data_quality_abstain = False
+    if dq_cfg.get("enabled", False):
+        min_dims = int(dq_cfg.get("min_dimensions_with_data", 3))
+        dims_with_data = sum(1 for r in ALL_ROLES if data_tiers[r] != "none")
+        if dims_with_data < min_dims:
+            data_quality_abstain = True
 
     # Conviction multiplier
     conviction_applied = False
@@ -978,7 +1116,12 @@ def compute_composite(
 
     # Abstain check (Step 4 feature) — with DYNAMIC zones based on F&G
     abstain_applied = False
-    if confidence_suppressed:
+    if data_quality_abstain:
+        # Phase C3: Data quality gate — insufficient dimensions with data
+        abstain_applied = True
+        label_name = "INSUFFICIENT DATA"
+        direction = "neutral"
+    elif confidence_suppressed:
         # Confidence gate overrides: force to neutral
         abstain_applied = True
         label_name = "INSUFFICIENT EDGE"
@@ -1006,8 +1149,22 @@ def compute_composite(
                     if zones:
                         resolved_distance = float(zones[-1].get("threshold", base_distance))
 
-        if abs(composite - 50.0) < resolved_distance:
-            abstain_applied = True
+        # Phase A1: Asymmetric abstain zones
+        asym_abstain = ABSTAIN_CFG.get("asymmetric", {})
+        if asym_abstain.get("enabled", False):
+            bearish_dist = float(asym_abstain.get("bearish_min_distance", resolved_distance))
+            bullish_dist = float(asym_abstain.get("bullish_min_distance", resolved_distance))
+            if composite < 50.0 and (50.0 - composite) < bearish_dist:
+                abstain_applied = True
+            elif composite > 50.0 and (composite - 50.0) < bullish_dist:
+                abstain_applied = True
+            elif composite == 50.0:
+                abstain_applied = True
+        else:
+            if abs(composite - 50.0) < resolved_distance:
+                abstain_applied = True
+
+        if abstain_applied:
             label_name = ABSTAIN_CFG.get("abstain_label", "INSUFFICIENT EDGE")
             direction = "neutral"
         else:
@@ -1230,7 +1387,15 @@ def run_backtest():
     # Re-score all assets at each time point
     # ================================================================
     print(f"\n  Re-scoring {len(aligned)} time points × {len(PROFILE.get('assets', []))} assets...")
-    assets_list = [a.upper() for a in PROFILE.get("assets", [])]
+    all_assets = [a.upper() for a in PROFILE.get("assets", [])]
+    # Phase A2: Asset blacklist — filter out anti-predictive assets
+    blacklist_cfg = PROFILE.get("asset_blacklist", {})
+    if blacklist_cfg.get("enabled", False):
+        blacklisted = {a.upper() for a in blacklist_cfg.get("assets", [])}
+        assets_list = [a for a in all_assets if a not in blacklisted]
+        print(f"  Asset blacklist: excluding {blacklisted} → {len(assets_list)} assets remaining")
+    else:
+        assets_list = all_assets
 
     all_signals: List[Dict] = []
     prev_dims_by_asset: Dict[str, Dict] = {}  # Track previous dimensions for delta scoring
@@ -1337,6 +1502,15 @@ def run_backtest():
                 continue
 
             target_time = sig["timestamp"] + timedelta(hours=wh)
+
+            # Phase B3: Temporal gating — prevent look-ahead bias
+            # Only score signals whose target evaluation time is in the past.
+            # I5 audit found backtest.py lacked this check that retroactive_accuracy.py
+            # correctly implements. Without this, future prices could leak into scoring.
+            now_ts = datetime.now(timezone.utc).timestamp()
+            if target_time.timestamp() > now_ts:
+                continue
+
             future_price = find_price_at_offset(tl, target_time, max_tolerance_hours=6.0)
             if future_price is None:
                 continue
@@ -1346,7 +1520,7 @@ def run_backtest():
                 continue
 
             pct_change = (future_price - signal_price) / signal_price * 100
-            g_score = gradient_score(sig["direction"], pct_change)
+            g_score = gradient_score(sig["direction"], pct_change, asset=asset)
             b_correct = binary_correct(sig["direction"], pct_change)
 
             ev = {
@@ -1524,6 +1698,138 @@ def run_backtest():
                 print(f"  {dim_name:>12s}: {', '.join(parts)}")
             else:
                 print(f"  {dim_name:>12s}: insufficient data")
+
+    # ================================================================
+    # PART 7: SPEARMAN IC (Information Coefficient) ANALYSIS
+    # ================================================================
+    print(f"\n{'='*80}")
+    print("PART 7: SPEARMAN IC (INFORMATION COEFFICIENT)")
+    print(f"{'='*80}")
+    print("Rank correlation between dimension/composite scores and future returns.\n")
+    print("IC > +0.05 = STRONG predictor | IC > 0 = OK | IC < 0 = ANTI-PREDICTIVE\n")
+
+    # Use only 24h-window evals for IC (most reliable forward-looking metric)
+    ic_evals = [e for e in all_evals if e.get("window_hours") == 24 and e.get("dimensions")]
+
+    if len(ic_evals) >= 10:
+        try:
+            from scipy.stats import spearmanr  # type: ignore
+        except ImportError:
+            # Pure Python Spearman fallback
+            def _rank(data):
+                indexed = sorted(enumerate(data), key=lambda x: x[1])
+                ranks = [0.0] * len(data)
+                i = 0
+                while i < len(indexed):
+                    j = i
+                    while j < len(indexed) - 1 and indexed[j + 1][1] == indexed[j][1]:
+                        j += 1
+                    avg_rank = (i + j) / 2.0 + 1
+                    for k in range(i, j + 1):
+                        ranks[indexed[k][0]] = avg_rank
+                    i = j + 1
+                return ranks
+
+            def spearmanr(x, y):
+                n = len(x)
+                rx, ry = _rank(x), _rank(y)
+                mx, my = sum(rx) / n, sum(ry) / n
+                num = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+                dx = sum((a - mx) ** 2 for a in rx) ** 0.5
+                dy = sum((b - my) ** 2 for b in ry) ** 0.5
+                rho = num / (dx * dy) if dx * dy > 0 else 0.0
+                return rho, 0.0  # pvalue placeholder
+
+        # Group by timestamp to create cross-asset slices
+        # IC should be computed cross-sectionally: at each time point,
+        # rank assets by score, rank by return, correlate
+        time_buckets: Dict[str, List[Dict]] = defaultdict(list)
+        for ev in ic_evals:
+            # Bucket to ~12h granularity
+            t = ev["timestamp"]
+            bucket_key = t.strftime("%Y-%m-%d") + ("_AM" if t.hour < 12 else "_PM")
+            time_buckets[bucket_key].append(ev)
+
+        # Need at least 3 assets per slice for meaningful correlation
+        valid_slices = {k: v for k, v in time_buckets.items() if len(v) >= 3}
+
+        if valid_slices:
+            # Per-dimension IC: average Spearman rho across slices
+            dim_ics: Dict[str, List[float]] = defaultdict(list)
+            composite_ics: List[float] = []
+
+            for bucket_key, slice_evals in sorted(valid_slices.items()):
+                returns = [e["pct_change"] for e in slice_evals]
+
+                # Composite IC
+                comp_scores = [e["score"] for e in slice_evals]
+                if len(set(comp_scores)) > 1 and len(set(returns)) > 1:
+                    rho, _ = spearmanr(comp_scores, returns)
+                    if not (rho != rho):  # check for NaN
+                        composite_ics.append(rho)
+
+                # Per-dimension IC
+                for dim_name in ALL_ROLES:
+                    dim_scores = []
+                    dim_returns = []
+                    for ev in slice_evals:
+                        dim = ev["dimensions"].get(dim_name, {})
+                        ds = dim.get("score")
+                        if ds is not None:
+                            dim_scores.append(ds)
+                            dim_returns.append(ev["pct_change"])
+
+                    if len(dim_scores) >= 3 and len(set(dim_scores)) > 1 and len(set(dim_returns)) > 1:
+                        rho, _ = spearmanr(dim_scores, dim_returns)
+                        if not (rho != rho):  # NaN check
+                            dim_ics[dim_name].append(rho)
+
+            # Print results
+            print(f"  Cross-asset slices: {len(valid_slices)} (need ≥3 assets each)")
+            print(f"\n  {'Dimension':>12s}  {'IC (avg)':>8s}  {'IC (med)':>8s}  {'Slices':>6s}  {'Status':>12s}")
+            print(f"  {'─'*12}  {'─'*8}  {'─'*8}  {'─'*6}  {'─'*12}")
+
+            for dim_name in ALL_ROLES:
+                ics = dim_ics.get(dim_name, [])
+                if ics:
+                    avg_ic = sum(ics) / len(ics)
+                    sorted_ics = sorted(ics)
+                    med_ic = sorted_ics[len(sorted_ics) // 2]
+                    if avg_ic > 0.05:
+                        status = "🟢 STRONG"
+                    elif avg_ic > 0:
+                        status = "🟡 OK"
+                    else:
+                        status = "🔴 ANTI-PRED"
+                    print(f"  {dim_name:>12s}  {avg_ic:>+8.4f}  {med_ic:>+8.4f}  {len(ics):>6d}  {status}")
+                else:
+                    print(f"  {dim_name:>12s}  {'N/A':>8s}  {'N/A':>8s}  {'0':>6s}  ⚪ NO DATA")
+
+            # Composite IC
+            if composite_ics:
+                avg_comp = sum(composite_ics) / len(composite_ics)
+                sorted_comp = sorted(composite_ics)
+                med_comp = sorted_comp[len(sorted_comp) // 2]
+                if avg_comp > 0.05:
+                    status = "🟢 STRONG"
+                elif avg_comp > 0:
+                    status = "🟡 OK"
+                else:
+                    status = "🔴 ANTI-PRED"
+                print(f"\n  {'COMPOSITE':>12s}  {avg_comp:>+8.4f}  {med_comp:>+8.4f}  {len(composite_ics):>6d}  {status}")
+
+                # Also compute ICIR (IC / std(IC)) for composite
+                if len(composite_ics) > 1:
+                    ic_std = (sum((x - avg_comp)**2 for x in composite_ics) / (len(composite_ics) - 1)) ** 0.5
+                    icir = avg_comp / ic_std if ic_std > 0 else 0
+                    print(f"  {'ICIR':>12s}  {icir:>+8.4f}  (IC/std — >0.5 is good)")
+            else:
+                print(f"\n  COMPOSITE: insufficient data for IC computation")
+        else:
+            print("  Insufficient cross-asset slices (need ≥3 assets per time bucket)")
+    else:
+        print(f"  Only {len(ic_evals)} 24h evals with dimensions (need ≥10 for IC)")
+        print("  Cannot compute Information Coefficient without more data.")
 
     # ================================================================
     # SUMMARY

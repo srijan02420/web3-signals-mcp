@@ -60,6 +60,10 @@ class DerivativesAgent(BaseAgent):
             "funding_rate_change_24h": None,
             "oi_change_pct_4h": None,
             "oi_change_pct_24h": None,
+            # Phase C1: Taker buy/sell ratio (E4 research)
+            "taker_buy_sell_ratio": None,
+            "taker_buy_vol": None,
+            "taker_sell_vol": None,
         }
 
     def collect(self) -> Tuple[Dict[str, Any], List[str]]:
@@ -113,6 +117,21 @@ class DerivativesAgent(BaseAgent):
                     asset["open_interest_usd"] = float(row.get("openInterest", 0.0))
             except Exception as exc:
                 errors.append(f"oi {sym}: {exc}")
+
+            # --- Taker Buy/Sell Ratio (Phase C1) ---
+            try:
+                ep = self.endpoints.get("taker_ratio", "/futures/data/takerlongshortRatio")
+                tr_period = self.binance_cfg.get("taker_ratio_period", "1h")
+                tr_limit = int(self.binance_cfg.get("taker_ratio_limit", 1))
+                url = f"{self.base_url}{ep}?symbol={futures_sym}&period={tr_period}&limit={tr_limit}"
+                rows = self._get_json(url)
+                if rows:
+                    row = rows[0]
+                    asset["taker_buy_sell_ratio"] = round(float(row.get("buySellRatio", 0)), 4)
+                    asset["taker_buy_vol"] = float(row.get("buyVol", 0))
+                    asset["taker_sell_vol"] = float(row.get("sellVol", 0))
+            except Exception as exc:
+                errors.append(f"taker_ratio {sym}: {exc}")
 
             # --- Score (thresholds from YAML) ---
             ls = asset.get("long_short_ratio")

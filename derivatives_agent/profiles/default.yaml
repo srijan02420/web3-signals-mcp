@@ -82,5 +82,12 @@ binance:
     long_short: "/futures/data/globalLongShortAccountRatio"
     funding_rate: "/fapi/v1/premiumIndex"
     open_interest: "/fapi/v1/openInterest"
+    # Phase C1 (2026-03-16): Taker buy/sell ratio — E4 research "easiest win"
+    # Same endpoint pattern as L/S ratio. Gives taker buy/sell volume (aggressive orders).
+    # Taker ratio > 1 = buyers aggressive, < 1 = sellers aggressive.
+    taker_ratio: "/futures/data/takerlongshortRatio"
   long_short_period: "1h"             # 5m, 15m, 30m, 1h, 2h, 4h, 6h, 12h, 1d
   long_short_limit: 1                 # how many periods to fetch (1 = latest only)
+  # Taker ratio settings
+  taker_ratio_period: "1h"            # match L/S period for consistency
+  taker_ratio_limit: 1                # latest only for now

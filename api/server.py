@@ -1373,9 +1373,9 @@ app.add_middleware(ProxySchemeMiddleware)
 async def root():
     response = {
         "name": "Web3 Signals API",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "description": "AI-powered crypto signal intelligence for 20 assets",
-        "model_version": "v0.2.0-regime-aware",
+        "model_version": "v0.3.0-calibrated",
         "endpoints": {
             "/dashboard": "Live signal intelligence dashboard (open in browser)",
             "/health": "Agent status and uptime",
@@ -1582,10 +1582,24 @@ async def get_asset_signal(asset: str):
                     "volume_status": price_data.get("volume_status"),
                 }
 
+    # Phase D: Extract prediction summary for easy API consumption
+    prediction = {
+        "direction": sig.get("direction"),
+        "conviction": sig.get("conviction", "unknown"),
+        "signal_strength": sig.get("signal_strength", "unknown"),
+        "predicted_move": sig.get("predicted_move"),
+    }
+    # Add calibrated probability if available
+    cal_conf = sig.get("calibrated_confidence")
+    if cal_conf:
+        prediction["calibrated_probability"] = cal_conf.get("calibrated_prob")
+        prediction["kelly_edge"] = cal_conf.get("kelly_edge")
+
     response = {
         "asset": asset,
         "timestamp": full.get("timestamp"),
         "signal": sig,
+        "prediction": prediction,
         "market_context": {
             "regime": portfolio.get("market_regime"),
             "risk_level": portfolio.get("risk_level"),

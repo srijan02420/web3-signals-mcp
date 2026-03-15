@@ -86,11 +86,61 @@ class WeightOptimizer:
         if new_weights is None:
             return None
 
+        # ---- Composite IC Guard (Phase 1 fix) ----
+        # Check if composite IC would be negative with these weights.
+        # If so, force-suppress all negative-IC dimensions.
+        composite_ic = ic_data.get("overall_ic") or ic_data.get("composite_ic")
+        guard_cfg = self.cfg.get("composite_ic_guard", {})
+        guard_enabled = guard_cfg.get("enabled", True)
+        guard_threshold = float(guard_cfg.get("threshold", -0.05))
+        bypass_ema_threshold = float(guard_cfg.get("bypass_ema_threshold", -0.10))
+
+        bypass_ema = False
+        if guard_enabled and composite_ic is not None and composite_ic < guard_threshold:
+            logger.warning(
+                "WeightOptimizer: COMPOSITE IC GUARD triggered! "
+                "composite_ic=%.4f < threshold=%.4f — force-suppressing negative-IC dims",
+                composite_ic, guard_threshold,
+            )
+            disable_factor = float(self.cfg.get("disable_factor", 0.15))
+            dimensions = ic_data.get("dimensions", {})
+            for role in self.all_roles:
+                dim_ic = dimensions.get(role, {}).get("ic")
+                if dim_ic is not None and dim_ic < 0:
+                    old_w = new_weights.get(role, 0.0)
+                    # Force to disable_factor × fallback weight
+                    fallback_w = float(self.cfg.get("fallback_weights", {}).get(role, 0.17))
+                    new_weights[role] = fallback_w * disable_factor
+                    reasons[role] = (
+                        f"GUARD-SUPPRESSED: IC={dim_ic:.4f} (composite={composite_ic:.4f}), "
+                        f"was {old_w:.4f} → {new_weights[role]:.4f}"
+                    )
+                    logger.warning("  %s: %s", role, reasons[role])
+
+            # Re-normalize after suppression
+            min_weight = float(self.cfg.get("min_weight", 0.05))
+            max_weight = float(self.cfg.get("max_weight", 0.40))
+            new_weights = self._apply_bounds(new_weights, min_weight, max_weight)
+
+            # If composite IC is severely negative, bypass EMA blending entirely
+            # (don't preserve 70% of old bad weights)
+            if composite_ic < bypass_ema_threshold:
+                bypass_ema = True
+                logger.warning(
+                    "WeightOptimizer: composite_ic=%.4f < bypass_threshold=%.4f "
+                    "— BYPASSING EMA blending (don't preserve old bad weights)",
+                    composite_ic, bypass_ema_threshold,
+                )
+
         # Detect IC decay
         self._detect_decay(ic_data)
 
-        # EMA blend with previous weights
-        blended = self._ema_blend(new_weights)
+        # EMA blend with previous weights (unless guard bypassed it)
+        if bypass_ema:
+            blended = new_weights
+            logger.info("WeightOptimizer: using raw IC weights (EMA bypassed by guard)")
+        else:
+            blended = self._ema_blend(new_weights)
 
         # Save weights, state, and change log
         self._save_weights(blended)
@@ -704,3 +754,109 @@ class WeightOptimizer:
                     return row[0] if row else 0
         except Exception:
             return 0
+
+    # ================================================================ #
+    #  Phase D: Model retraining (Platt + LightGBM + meta-labeler)
+    # ================================================================ #
+
+    def should_retrain_models(self) -> bool:
+        """
+        Check if Phase D models (calibrator, meta-learner, meta-labeler)
+        need retraining. Triggers every 7 days.
+        """
+        phase_d_cfg = self.profile.get("phase_d", {})
+        if not phase_d_cfg:
+            return False
+
+        retrain_interval_hours = int(phase_d_cfg.get("retrain_interval_hours", 168))  # 7 days
+
+        state = self.store.load_kv_json(self.namespace, "model_retrain_state")
+        if not state:
+            return True  # Never retrained
+
+        last_retrain = state.get("last_retrain_at")
+        if not last_retrain:
+            return True
+
+        try:
+            last_dt = datetime.fromisoformat(last_retrain)
+            hours_since = (datetime.now(timezone.utc) - last_dt).total_seconds() / 3600
+            return hours_since >= retrain_interval_hours
+        except (ValueError, TypeError):
+            return True
+
+    def retrain_phase_d_models(
+        self,
+        training_data_path: str = "/tmp/calibration_data.json",
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Retrain all Phase D models: Platt calibrator, LightGBM meta-learner,
+        and meta-labeler using the latest training data.
+
+        Returns summary of retraining results.
+        """
+        from pathlib import Path
+        results: Dict[str, Any] = {}
+
+        models_dir = Path(__file__).resolve().parent / "models"
+        models_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1. Retrain Platt calibrators
+        try:
+            from signal_fusion.calibrator import SignalCalibrator
+            calibrator = SignalCalibrator()
+            cal_results = calibrator.fit_from_file(training_data_path)
+            cal_path = str(models_dir / "platt_calibrators.json")
+            calibrator.save(cal_path)
+            results["calibrator"] = {
+                "status": "success",
+                "dimensions_fitted": sum(1 for v in cal_results.values() if v.get("fitted")),
+                "total_dimensions": len(cal_results),
+            }
+            if verbose:
+                print(f"  Calibrator: fitted {results['calibrator']['dimensions_fitted']} dimensions")
+        except Exception as exc:
+            results["calibrator"] = {"status": "error", "error": str(exc)}
+            if verbose:
+                print(f"  Calibrator: ERROR — {exc}")
+
+        # 2. Retrain LightGBM meta-learner
+        try:
+            from signal_fusion.meta_learner import MetaLearner
+            learner = MetaLearner()
+            stats = learner.train(training_data_path, verbose=verbose)
+            learner.save()
+            results["meta_learner"] = {
+                "status": "success",
+                "cv_accuracy": stats.get("cv_accuracy_mean", 0),
+                "n_samples": stats.get("n_samples", 0),
+            }
+        except Exception as exc:
+            results["meta_learner"] = {"status": "error", "error": str(exc)}
+            if verbose:
+                print(f"  Meta-learner: ERROR — {exc}")
+
+        # 3. Retrain meta-labeler
+        try:
+            from signal_fusion.meta_labeler import MetaLabeler
+            labeler = MetaLabeler()
+            stats = labeler.train(training_data_path, verbose=verbose)
+            labeler.save()
+            results["meta_labeler"] = {
+                "status": "success",
+                "cv_accuracy": stats.get("cv_accuracy", 0),
+                "n_samples": stats.get("n_samples", 0),
+            }
+        except Exception as exc:
+            results["meta_labeler"] = {"status": "error", "error": str(exc)}
+            if verbose:
+                print(f"  Meta-labeler: ERROR — {exc}")
+
+        # Save retrain state
+        self.store.save_kv_json(self.namespace, "model_retrain_state", {
+            "last_retrain_at": datetime.now(timezone.utc).isoformat(),
+            "results": results,
+        })
+
+        return results

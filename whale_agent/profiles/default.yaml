@@ -216,17 +216,19 @@ whale_wallets:
   # Specific known whale/fund/DAO ETH wallets to monitor
   # Balance changes in these = smart money movement
   # Addresses verified on Etherscan labeled accounts (Feb 2026)
+  #
+  # PHASE B2 (2026-03-16): Removed market makers and OTC desks (E3 Fix 3):
+  #   - Jump Trading: market maker — balance changes reflect client orders, not conviction
+  #   - Cumberland (DRW Trading): market maker — provides liquidity, not direction
+  #   - FalconX: OTC desk — balance changes are client settlement, not directional
+  # Their flow is net zero over time; including them adds pure noise to directional signals.
+  # Only tracking wallets with documented directional conviction.
   eth_wallets:
-    "Jump Trading":
-      address: "0xF584F8728B874a6a5c7A8d4d387C9aae9172D621"      # 5,200+ ETH
+    # REMOVED: Jump Trading (market maker), Cumberland (market maker), FalconX (OTC desk)
     "Galaxy Digital":
-      address: "0x15abb66ba754f05cbc0165a64a11cded1543de48"      # 14,000+ ETH
+      address: "0x15abb66ba754f05cbc0165a64a11cded1543de48"      # 14,000+ ETH — fund with directional thesis
     "Abraxas Capital":
-      address: "0xb99a2c4c1c4f1fc27150681b740396f6ce1cbcf5"      # LST/restaking whale
-    "Cumberland":
-      address: "0xad6eaa735d9df3d7696fd03984379dae02ed8862"      # 1,100+ ETH (DRW Trading)
-    "FalconX":
-      address: "0x1157a2076b9bb22a85cc2c162f20fab3898f4101"      # 2,100+ ETH (OTC desk)
+      address: "0xb99a2c4c1c4f1fc27150681b740396f6ce1cbcf5"      # LST/restaking whale — conviction buyer
 
   # BTC whale wallets — MicroStrategy/Tesla addresses not publicly available
   # BTC whale activity tracked via Layer 1 (Whale Alert API) + Layer 3 (exchange wallet txs)
