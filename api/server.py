@@ -240,8 +240,18 @@ if _X402_ENABLED:
         )
         if declare_discovery_extension else {}
     )
-    # Inject discoverable/category/tags into bazaar extension (required for Bazaar indexing)
-    _bazaar_signal = {**_bazaar_signal_raw, "discoverable": True, "category": "api", "tags": _bazaar_tags} if _bazaar_signal_raw else {}
+    # Inject discoverable/category/tags INSIDE the "bazaar" dict (required for Bazaar indexing)
+    # declare_discovery_extension returns {"bazaar": {"info": ..., "schema": ...}}
+    def _inject_bazaar_metadata(ext: dict) -> dict:
+        if not ext or "bazaar" not in ext:
+            return ext
+        result = {k: (dict(v) if isinstance(v, dict) else v) for k, v in ext.items()}
+        result["bazaar"]["discoverable"] = True
+        result["bazaar"]["category"] = "api"
+        result["bazaar"]["tags"] = _bazaar_tags
+        return result
+
+    _bazaar_signal = _inject_bazaar_metadata(_bazaar_signal_raw) if _bazaar_signal_raw else {}
     _bazaar_signal_asset_raw = (
         declare_discovery_extension(
             input={"method": "GET", "path_params": {"asset": "BTC"}},
@@ -281,7 +291,7 @@ if _X402_ENABLED:
         )
         if declare_discovery_extension else {}
     )
-    _bazaar_signal_asset = {**_bazaar_signal_asset_raw, "discoverable": True, "category": "api", "tags": _bazaar_tags} if _bazaar_signal_asset_raw else {}
+    _bazaar_signal_asset = _inject_bazaar_metadata(_bazaar_signal_asset_raw) if _bazaar_signal_asset_raw else {}
     _bazaar_reputation_raw = (
         declare_discovery_extension(
             input={"method": "GET"},
@@ -306,7 +316,7 @@ if _X402_ENABLED:
         )
         if declare_discovery_extension else {}
     )
-    _bazaar_reputation = {**_bazaar_reputation_raw, "discoverable": True, "category": "api", "tags": _bazaar_tags} if _bazaar_reputation_raw else {}
+    _bazaar_reputation = _inject_bazaar_metadata(_bazaar_reputation_raw) if _bazaar_reputation_raw else {}
 
     # --- unpaid_response_body callbacks: return rich SAMPLE data in 402 ---
     # This is critical for agent discovery. Competitors like tick.hugen.tokyo
