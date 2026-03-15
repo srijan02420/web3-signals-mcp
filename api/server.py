@@ -251,7 +251,7 @@ if _X402_ENABLED:
         result["bazaar"]["tags"] = _bazaar_tags
         return result
 
-    _bazaar_signal = _bazaar_signal_raw  # TEMP: skip metadata injection to test settlement
+    _bazaar_signal = _inject_bazaar_metadata(_bazaar_signal_raw) if _bazaar_signal_raw else {}
     _bazaar_signal_asset_raw = (
         declare_discovery_extension(
             input={"method": "GET", "path_params": {"asset": "BTC"}},
@@ -291,7 +291,7 @@ if _X402_ENABLED:
         )
         if declare_discovery_extension else {}
     )
-    _bazaar_signal_asset = _bazaar_signal_asset_raw  # TEMP: skip metadata injection to test settlement
+    _bazaar_signal_asset = _inject_bazaar_metadata(_bazaar_signal_asset_raw) if _bazaar_signal_asset_raw else {}
     _bazaar_reputation_raw = (
         declare_discovery_extension(
             input={"method": "GET"},
@@ -316,7 +316,7 @@ if _X402_ENABLED:
         )
         if declare_discovery_extension else {}
     )
-    _bazaar_reputation = _bazaar_reputation_raw  # TEMP: skip metadata injection to test settlement
+    _bazaar_reputation = _inject_bazaar_metadata(_bazaar_reputation_raw) if _bazaar_reputation_raw else {}
 
     # --- unpaid_response_body callbacks: return rich SAMPLE data in 402 ---
     # This is critical for agent discovery. Competitors like tick.hugen.tokyo
@@ -1352,8 +1352,18 @@ app.add_middleware(
 )
 
 
-# NOTE: ProxySchemeMiddleware temporarily disabled for debugging.
-# TODO: Re-enable once settlement 500 is fixed.
+# Proxy scheme rewrite — Railway proxies HTTPS→HTTP internally.
+# Without this, x402 SDK infers http:// resource URLs from request.url.
+# This middleware rewrites the request scheme to HTTPS when X-Forwarded-Proto
+# is set, so all downstream middleware (including x402) see the correct URL.
+class ProxySchemeMiddleware(BaseHTTPMiddleware):
+    """Rewrite request scheme to HTTPS when behind a reverse proxy."""
+    async def dispatch(self, request, call_next):
+        if request.headers.get("x-forwarded-proto") == "https":
+            request.scope["scheme"] = "https"
+        return await call_next(request)
+
+app.add_middleware(ProxySchemeMiddleware)
 
 
 # ---------------------------------------------------------------------------
