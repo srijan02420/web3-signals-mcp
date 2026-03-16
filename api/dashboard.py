@@ -252,6 +252,66 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .card-label.neutral { background: var(--yellow-bg); color: var(--yellow); }
   .card-label.moderate-sell { background: var(--red-bg); color: var(--red); }
   .card-label.strong-sell { background: var(--red-bg); color: var(--red); }
+  .card-label.insufficient-edge { background: var(--yellow-bg); color: var(--text-dim); }
+
+  /* Phase D: Conviction + Predicted Move */
+  .card-prediction {
+    display: flex; align-items: center; gap: 6px;
+    margin: 6px 0 8px 8px; font-size: 11px;
+  }
+  .conviction-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  .conviction-badge.high { background: var(--green-bg); color: var(--green); }
+  .conviction-badge.medium { background: var(--blue-bg); color: var(--blue); }
+  .conviction-badge.low { background: var(--yellow-bg); color: var(--yellow); }
+  .conviction-badge.none { background: var(--surface2); color: var(--text-dim); }
+  .predicted-move {
+    color: var(--text-dim); font-size: 11px; font-weight: 500;
+  }
+  .predicted-move.positive { color: var(--green); }
+  .predicted-move.negative { color: var(--red); }
+
+  /* Modal prediction section */
+  .modal-prediction {
+    background: var(--surface2); border-radius: 10px;
+    padding: 16px; margin: 16px 0; border: 1px solid var(--border);
+  }
+  .modal-prediction .section-title {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1px;
+    color: var(--cyan); font-weight: 600; margin-bottom: 12px;
+  }
+  .modal-prediction .pred-grid {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  }
+  .modal-prediction .pred-item {
+    display: flex; flex-direction: column; gap: 2px;
+  }
+  .modal-prediction .pred-label {
+    font-size: 11px; color: var(--text-dim); text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .modal-prediction .pred-value {
+    font-size: 16px; font-weight: 700;
+  }
+  .modal-prediction .pred-value.green { color: var(--green); }
+  .modal-prediction .pred-value.red { color: var(--red); }
+  .modal-prediction .pred-value.blue { color: var(--blue); }
+  .modal-prediction .pred-value.yellow { color: var(--yellow); }
+  .modal-prediction .pred-value.dim { color: var(--text-dim); }
+  .modal-prediction .pred-range {
+    font-size: 12px; color: var(--text-dim); margin-top: 4px;
+  }
+  .signal-strength-badge {
+    display: inline-block; padding: 2px 8px; border-radius: 3px;
+    font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+    text-transform: uppercase;
+  }
+  .signal-strength-badge.strong { background: var(--green-bg); color: var(--green); }
+  .signal-strength-badge.moderate { background: var(--blue-bg); color: var(--blue); }
+  .signal-strength-badge.weak { background: var(--surface2); color: var(--text-dim); }
 
   /* Dimension bars */
   .dimensions { padding-left: 8px; }
@@ -886,6 +946,7 @@ function renderGrid(list) {
             <span class="score ${dir}">${(s.composite_score || 0).toFixed(1)}</span>
           </div>
           <span class="card-label ${labelClass}">${s.label || 'N/A'}</span>
+          ${renderCardPrediction(s)}
           <div class="dimensions">
             ${renderDimBar('whale', dims.whale)}
             ${renderDimBar('technical', dims.technical)}
@@ -910,6 +971,31 @@ function renderDimBar(name, dim) {
     </div>`;
 }
 
+function renderCardPrediction(s) {
+  const conv = s.conviction || 'none';
+  const pm = s.predicted_move || {};
+  const exp = pm.expected_pct || 0;
+  const strength = s.signal_strength || 'weak';
+
+  if (conv === 'none' && Math.abs(exp) < 0.01) {
+    return `<div class="card-prediction">
+      <span class="conviction-badge none">no edge</span>
+    </div>`;
+  }
+
+  const moveClass = exp > 0 ? 'positive' : exp < 0 ? 'negative' : '';
+  const moveStr = exp !== 0 ? `${exp > 0 ? '+' : ''}${exp.toFixed(1)}%` : '';
+  const rangeStr = pm.range_low_pct != null && pm.range_high_pct != null && exp !== 0
+    ? ` (${pm.range_low_pct > 0 ? '+' : ''}${pm.range_low_pct.toFixed(1)}% to ${pm.range_high_pct > 0 ? '+' : ''}${pm.range_high_pct.toFixed(1)}%)`
+    : '';
+
+  return `<div class="card-prediction">
+    <span class="conviction-badge ${conv}">${conv}</span>
+    <span class="signal-strength-badge ${strength}">${strength}</span>
+    ${moveStr ? `<span class="predicted-move ${moveClass}">${moveStr}</span>` : ''}
+  </div>`;
+}
+
 function renderTable(list) {
   const sortIcon = (field) => sortField === field ? (sortDir > 0 ? ' ▲' : ' ▼') : '';
   const sortCls = (field) => sortField === field ? 'sorted' : '';
@@ -926,6 +1012,8 @@ function renderTable(list) {
         <th class="${sortCls('narrative')}" onclick="setSort('narrative')">Narrative${sortIcon('narrative')}</th>
         <th class="${sortCls('market')}" onclick="setSort('market')">Market${sortIcon('market')}</th>
         <th class="${sortCls('trend')}" onclick="setSort('trend')">Trend${sortIcon('trend')}</th>
+        <th>Conviction</th>
+        <th>Predicted</th>
         <th>Momentum</th>
       </tr></thead>
       <tbody>
@@ -943,6 +1031,8 @@ function renderTable(list) {
             <td style="color:${dimColor(dims.narrative?.score)}">${dims.narrative?.score ?? '—'}</td>
             <td style="color:${dimColor(dims.market?.score)}">${dims.market?.score ?? '—'}</td>
             <td style="color:${dimColor(dims.trend?.score)}">${dims.trend?.score ?? '—'}</td>
+            <td><span class="conviction-badge ${s.conviction || 'none'}">${s.conviction || 'none'}</span></td>
+            <td class="predicted-move ${(s.predicted_move?.expected_pct||0) > 0 ? 'positive' : (s.predicted_move?.expected_pct||0) < 0 ? 'negative' : ''}">${(s.predicted_move?.expected_pct||0) !== 0 ? ((s.predicted_move?.expected_pct||0) > 0 ? '+' : '') + (s.predicted_move?.expected_pct||0).toFixed(1) + '%' : '—'}</td>
             <td>${s.momentum || 'new'}</td>
           </tr>`;
         }).join('')}
@@ -1446,6 +1536,69 @@ function toggleExpand(rowId) {
   if (prevTd) prevTd.textContent = expandedRows.has(rowId) ? '▼' : '▶';
 }
 
+function renderModalPrediction(s) {
+  const conv = s.conviction || 'none';
+  const strength = s.signal_strength || 'weak';
+  const pm = s.predicted_move || {};
+  const ml = s.meta_learner || {};
+  const mlb = s.meta_label || {};
+  const cal = s.calibrated_confidence || {};
+
+  const exp = pm.expected_pct || 0;
+  const moveColor = exp > 0 ? 'green' : exp < 0 ? 'red' : 'dim';
+  const moveStr = exp !== 0
+    ? `${exp > 0 ? '+' : ''}${exp.toFixed(1)}%`
+    : 'Neutral';
+  const rangeStr = (pm.range_low_pct != null && pm.range_high_pct != null && exp !== 0)
+    ? `Range: ${pm.range_low_pct > 0 ? '+' : ''}${pm.range_low_pct.toFixed(1)}% to ${pm.range_high_pct > 0 ? '+' : ''}${pm.range_high_pct.toFixed(1)}%`
+    : '';
+  const horizon = pm.horizon || '24h';
+
+  const convColor = conv === 'high' ? 'green' : conv === 'medium' ? 'blue' : conv === 'low' ? 'yellow' : 'dim';
+  const strengthColor = strength === 'strong' ? 'green' : strength === 'moderate' ? 'blue' : 'dim';
+
+  const mlProb = ml.probability != null ? `${(ml.probability * 100).toFixed(1)}%` : '—';
+  const mlColor = ml.probability > 0.6 ? 'green' : ml.probability > 0.5 ? 'blue' : ml.probability != null ? 'red' : 'dim';
+
+  const edge = cal.kelly_edge != null ? `${(cal.kelly_edge * 100).toFixed(1)}%` : '—';
+  const edgeColor = cal.kelly_edge > 0.05 ? 'green' : cal.kelly_edge > 0 ? 'blue' : cal.kelly_edge != null ? 'red' : 'dim';
+
+  const metaStatus = mlb.should_emit === true ? 'Approved' : mlb.should_emit === false ? 'Rejected' : '—';
+  const metaColor = mlb.should_emit === true ? 'green' : mlb.should_emit === false ? 'red' : 'dim';
+
+  return `
+    <div class="modal-prediction">
+      <div class="section-title">Prediction (${horizon})</div>
+      <div class="pred-grid">
+        <div class="pred-item">
+          <span class="pred-label">Expected Move</span>
+          <span class="pred-value ${moveColor}">${moveStr}</span>
+          ${rangeStr ? `<span class="pred-range">${rangeStr}</span>` : ''}
+        </div>
+        <div class="pred-item">
+          <span class="pred-label">Conviction</span>
+          <span class="pred-value ${convColor}" style="text-transform:capitalize">${conv}</span>
+        </div>
+        <div class="pred-item">
+          <span class="pred-label">Signal Strength</span>
+          <span class="signal-strength-badge ${strength}">${strength}</span>
+        </div>
+        <div class="pred-item">
+          <span class="pred-label">ML Confidence</span>
+          <span class="pred-value ${mlColor}">${mlProb}</span>
+        </div>
+        <div class="pred-item">
+          <span class="pred-label">Kelly Edge</span>
+          <span class="pred-value ${edgeColor}">${edge}</span>
+        </div>
+        <div class="pred-item">
+          <span class="pred-label">Meta-Label</span>
+          <span class="pred-value ${metaColor}">${metaStatus}</span>
+        </div>
+      </div>
+    </div>`;
+}
+
 function openModal(asset) {
   const signals = signalData?.data?.signals;
   const s = signals?.[asset];
@@ -1471,6 +1624,7 @@ function openModal(asset) {
       ${s.momentum ? 'Momentum: ' + s.momentum : ''}
       ${s.prev_score != null ? ' | Prev: ' + s.prev_score : ''}
     </div>
+    ${renderModalPrediction(s)}
     <div class="modal-dim-detail">
       ${dimOrder.map(d => {
         const dim = dims[d] || {};
