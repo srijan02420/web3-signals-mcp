@@ -1327,10 +1327,33 @@ class UsageTrackingMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# x402 middleware — added first so it runs INNER (handles payments)
-if _X402_ENABLED:
-    app.add_middleware(PaymentMiddlewareASGI, routes=_x402_routes, server=_x402_server)
-    logger.info("x402 payment gate enabled (facilitator=%s)", _X402_FACILITATOR_URL)
+# ---------------------------------------------------------------------------
+# Key0 internal auth — all requests must carry X-Key0-Internal-Token.
+# Key0 Docker acts as the public gateway; this ensures only Key0 can reach
+# the FastAPI backend directly.
+# ---------------------------------------------------------------------------
+_KEY0_PROXY_SECRET = os.getenv("KEY0_PROXY_SECRET", "")
+
+
+@app.middleware("http")
+async def require_key0_token(request: Request, call_next: Any) -> Any:
+    """Reject requests that don't carry the Key0 internal token."""
+    # Pass through if no secret is configured (local dev without Key0)
+    if not _KEY0_PROXY_SECRET:
+        return await call_next(request)
+    token = request.headers.get("x-key0-internal-token", "")
+    if token != _KEY0_PROXY_SECRET:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "unauthorized",
+                "message": "This API is only accessible via the Key0 gateway.",
+                "mcp_endpoint": os.getenv("KEY0_PUBLIC_URL", "https://api.web3signals.com") + "/mcp",
+                "discovery": os.getenv("KEY0_PUBLIC_URL", "https://api.web3signals.com") + "/discovery",
+            },
+        )
+    return await call_next(request)
+
 
 # Cache-Control — agent-friendly caching hints per endpoint
 app.add_middleware(CacheControlMiddleware)
